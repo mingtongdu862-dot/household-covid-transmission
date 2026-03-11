@@ -138,22 +138,6 @@ SHAP_CONFIG = {
 }
 ```
 
----
-
-## Task Formulation
-
-The task is framed as **binary classification at the household level**.
-
-- **Positive label (y = 1):** at least one secondary transmission event occurred in the household during the first COVID-19 wave of 2020.
-- **Negative label (y = 0):** the index case(s) did not infect any other household member.
-
-Secondary cases are defined using a **2-day co-infection window** and a **14-day incubation window**:
-
-- Cases diagnosed ≤ 2 days after the first household case are classified as co-primary (index cases).
-- Cases diagnosed 3–14 days after the first household case are classified as secondary.
-- Cases diagnosed > 14 days later belong to a separate transmission cluster and are excluded from the primary outcome.
-
-The study cohort consists of **252,472 households** (positive rate: 18.8 %).
 
 ---
 
