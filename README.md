@@ -2,25 +2,18 @@
 
 Source code for the paper:
 
-> **TabPFN for Household SARS-CoV-2 Secondary Transmission Risk Prediction:
-> A National Register-Based Study with Interpretability Analysis**
-
----
+> **Household SARS-CoV-2 Secondary Transmission Risk Prediction for Swedish National Register Data Using TabPFN with Explainability**
 
 ## Overview
 
-This repository implements a machine-learning pipeline that predicts whether
-a household will experience at least one secondary SARS-CoV-2 transmission
-event, given demographic, socio-economic, and clinical features of its members.
+This repository contains the full code for a study that predicts whether secondary COVID-19 transmission will occur within a household, using data from Swedish national health and socioeconomic registers during the first wave of 2020 (pre-vaccination period). The pipeline covers:
 
-The study uses data from the Swedish national health registers covering the
-pre-vaccination period (2020), comprising 252,472 households.
-The primary model is a custom bagging ensemble of **TabPFN v2.5** classifiers.
-A **Random Forest** baseline is also provided for comparison.
-
-A three-level interpretability framework is applied to the trained ensemble:
-global permutation importance, risk-stratified subgroup analysis, and local
-SHAP waterfall plots.
+1. **Data preprocessing** – time-filtering, feature selection, and population-index construction from raw register CSVs.
+2. **Household mapping** – building a wide-format household-to-member table.
+3. **Feature extraction** – individual-level static (demographic/socioeconomic) and dynamic (medical-history) features.
+4. **Feature aggregation** – aggregating person-level features to the household level, encoding, and producing stratified k-fold splits.
+5. **Model training** – TabPFN ensemble (primary model) plus Logistic Regression, Random Forest, and XGBoost baselines.
+6. **Explainability analysis** – global permutation importance, Kernel SHAP (subgroup and local waterfall plots).
 
 ---
 
@@ -28,225 +21,236 @@ SHAP waterfall plots.
 
 ```
 .
-├── household_mapping.py          # Step 1 — build household-to-member mapping
-├── feature_engineering.py        # Step 2 — aggregate and encode features
-├── tabpfn_config.py              # Shared configuration for TabPFN scripts
-├── tabpfn_ensemble.py            # TabPFN bagging ensemble class definition
-├── random_forest_baseline.py     # Random Forest baseline (5-fold CV)
-└── README.md
+├── config.py                          # Centralised configuration for TabPFN and XAI
+│
+├── data_preprocessing.py              # Step 1 – Time-filtering, feature selection,
+│                                      #          CSV→dict conversion, population index
+├── household_mapping.py               # Step 2 – Household-to-member mapping table
+├── feature_extraction.py              # Step 3 – Individual-level feature extraction
+├── feature_aggregation.py             # Step 4 – Household-level aggregation, encoding,
+│                                      #          chi-square selection, k-fold splits
+│
+├── tabpfn_ensemble.py                 # Step 5a – TabPFN ensemble class (SamplingStrategy,
+│                                      #           FeatureSelector, TabPFNEnsemble)
+├── tabpfn_train.py                    # Step 5b – TabPFN 5-fold CV training & evaluation
+│                                      #           (equivalent to baseline scripts)
+├── tabpfn_xai.py                      # Step 5c – Explainability analysis (PI + SHAP)
+│
+├── baseline_logistic_regression.py    # Logistic Regression baseline
+├── baseline_random_forest.py          # Random Forest baseline
+└── baseline_xgboost.py               # XGBoost baseline
 ```
 
-### Script descriptions
+---
 
-| File | Purpose |
-|------|---------|
-| `household_mapping.py` | Reads the person-household linkage file and outputs a wide-format CSV mapping each household to its member IDs. |
-| `feature_engineering.py` | Aggregates person-level register features to household level, applies chi-square feature selection, and exports stratified 5-fold train/validation/test splits. |
-| `tabpfn_config.py` | Centralised hyperparameter file — paths, TabPFN model settings, bagging strategy, class-balance settings, and SHAP configuration. |
-| `tabpfn_ensemble.py` | `TabPFNEnsemble` class, `SamplingStrategy` class, and `FeatureSelector` class. Imported by training and explainability scripts. |
-| `random_forest_baseline.py` | Trains a Random Forest with configurable imbalance-handling across 5 folds; evaluates on a balanced 50 % positive held-out subset to match the TabPFN evaluation protocol. |
+## Pipeline Execution Order
+
+Run the scripts in the following order to reproduce the study from raw register data:
+
+```bash
+# Step 1: Preprocess raw register data
+python data_preprocessing.py
+
+# Step 2: Build household membership table
+python household_mapping.py
+
+# Step 3: Extract individual-level features
+python feature_extraction.py
+
+# Step 4: Aggregate to household level and create k-fold splits
+python feature_aggregation.py
+
+# Step 5a: Train and evaluate the TabPFN ensemble (5-fold CV, matches baseline format)
+python tabpfn_train.py
+
+# Step 5b: Run explainability analysis on the trained ensemble
+python tabpfn_xai.py
+
+# Note: tabpfn_ensemble.py is the class library imported by both scripts above.
+
+# Optional: Train baseline models
+python baseline_logistic_regression.py
+python baseline_random_forest.py
+python baseline_xgboost.py
+```
+
+---
+
+## Data Requirements
+
+This pipeline was designed for **Swedish national register data** accessed through SWECOV. The expected input files are:
+
+| File | Contents |
+|------|----------|
+| `FHM_SMINET.csv` | Laboratory-confirmed COVID-19 diagnoses (diagnosis dates) |
+| `Population_PersonNr_20221231.csv` | Population register (sex, birth year/month) |
+| `Fodelseuppg_20201231.csv` | Country of birth and immigration background |
+| `HushallPerson_2019.csv` | Household membership (household ID per person) |
+| `HushallBoende_2019.csv` | Housing type and living area per person |
+| `Individ_2019.csv` | Disposable personal and family income |
+| `Inera_VPTU_Coronadata.csv` | Primary-care contact reasons (2019–2020) |
+| `SWECOV_SOS_LMED.csv` | Dispensed medications – ATC codes (2019–2020) |
+| `SWECOV_SOS_OV.csv` | Outpatient diagnoses – ICD-10 (all years) |
+| `SWECOV_SOS_SV.csv` | Inpatient diagnoses – ICD-10 (all years) |
+| `SWECOV_SOS_DORS.csv` | Death dates (2020) |
+| `SWECOV_SOS_SOL.csv` | Elderly care (TRYGG indicators, 2018–2020) |
+| `RTB2019.csv` | 2019 population register for 2020 base population |
+
+Set the path to the raw data directory in `data_preprocessing.py`:
+
+```python
+class Config:
+    INPUT_DIR_RAW = '/path/to/raw_register_data'
+```
+
+> **Note:** The register data are not redistributable. Access requires a formal data application to the Swedish authority holding the relevant registers.
+
+---
+
+## Configuration
+
+All key settings are centralised in `config.py`. The most important parameters are:
+
+```python
+# Input / output
+FOLDS_PATH  = 'Encoded_Household_Features_Full'  # K-fold CSV directory
+OUTPUT_DIR  = 'TabPFN_XAI_Results_Full/'          # Results and plots
+
+# TabPFN limits (v2.5 large-samples checkpoint)
+TABPFN_MAX_SAMPLES  = 50_000
+TABPFN_MAX_FEATURES = 2_000
+
+# Ensemble strategy
+ENSEMBLE_CONFIG = {
+    'n_bags'          : 8,       # Number of bags
+    'bag_sample_size' : 40_000,  # Training samples per bag
+    'balance_classes' : True,
+    'target_ratio'    : 0.6,     # 60 % positive per bag (oversampling)
+    ...
+}
+
+# SHAP analysis
+SHAP_CONFIG = {
+    'n_background'      : 50,
+    'n_explain_global'  : 1_000,
+    'max_evals'         : 120,
+    ...
+}
+```
+
+---
+
+## Task Formulation
+
+The task is framed as **binary classification at the household level**.
+
+- **Positive label (y = 1):** at least one secondary transmission event occurred in the household during the first COVID-19 wave of 2020.
+- **Negative label (y = 0):** the index case(s) did not infect any other household member.
+
+Secondary cases are defined using a **2-day co-infection window** and a **14-day incubation window**:
+
+- Cases diagnosed ≤ 2 days after the first household case are classified as co-primary (index cases).
+- Cases diagnosed 3–14 days after the first household case are classified as secondary.
+- Cases diagnosed > 14 days later belong to a separate transmission cluster and are excluded from the primary outcome.
+
+The study cohort consists of **252,472 households** (positive rate: 18.8 %).
+
+---
+
+## Model Architecture
+
+### TabPFN Ensemble (Primary Model)
+
+`tabpfn_ensemble.py` trains K = 8 TabPFN v2.5 (`large-samples` checkpoint) classifiers in a bagging framework.
+
+Each bag draws 40,000 training samples from the full training set, resampled to a 60 % positive ratio (24,000 positive + 16,000 negative). This oversampling strategy is the key design choice that enables Recall₊ = 0.905 on the balanced test subset.
+
+Inference uses soft-voting (arithmetic mean of predicted probabilities) across all bags, optionally weighted by each bag's OOB AUC score.
+
+**Requires an NVIDIA GPU.** Training 8 bags takes ≈ 160 seconds on an A100-40 GB.
+
+### Baselines
+
+All three baseline scripts (Logistic Regression, Random Forest, XGBoost) follow the same evaluation protocol:
+
+1. Train on full imbalanced training folds with `class_weight='balanced'` (or `scale_pos_weight` for XGBoost).
+2. Evaluate on a balanced held-out subset (n = 4,000, 50 % positive) to ensure fair comparison with TabPFN.
+
+---
+
+## Explainability
+
+`tabpfn_xai.py` implements a three-level interpretability framework:
+
+| Level | Method | Purpose |
+|-------|--------|---------|
+| Global | Permutation Importance (AUC-drop, n = 3,000, R = 5) | Which features matter overall? |
+| Subgroup | PI + Kernel SHAP on risk strata | Do importance patterns differ by predicted risk? |
+| Local | Kernel SHAP waterfall plots | Why did the model assign this score to this household? |
+
+The risk strata are defined by the ensemble's predicted probability:
+- **High risk:** ŷ ≥ 0.7
+- **Moderate risk:** 0.3 ≤ ŷ < 0.7
+- **Low risk:** ŷ < 0.3
+
+---
+
+## Results Summary
+
+| Metric | Logistic Reg. | Random Forest | XGBoost | **TabPFN** |
+|--------|:---:|:---:|:---:|:---:|
+| Macro AUC | 0.620 ± 0.003 | 0.612 ± 0.002 | **0.627** ± 0.003 | 0.626 ± 0.002 |
+| MCC | 0.170 ± 0.008 | 0.134 ± 0.006 | 0.176 ± 0.011 | **0.186** ± 0.003 |
+| Recall₊ | 0.603 ± 0.014 | 0.420 ± 0.006 | 0.552 ± 0.007 | **0.905** ± 0.016 |
+| F1₊ | 0.592 ± 0.008 | 0.491 ± 0.005 | 0.572 ± 0.006 | **0.677** ± 0.003 |
+
+Evaluation on a balanced held-out subset (n = 4,000; 50 % positive prevalence).
 
 ---
 
 ## Requirements
 
-### Python version
-Python ≥ 3.9
-
-### Dependencies
-
 ```
-tabpfn>=2.0
-torch
+python >= 3.9
+tabpfn >= 2.5          # TabPFN v2.5 with large-samples checkpoint
+torch                  # PyTorch (GPU recommended)
 scikit-learn
+xgboost
 imbalanced-learn
+shap
 pandas
 numpy
 tqdm
 psutil
-shap
 ```
 
-Install all dependencies with:
+Install dependencies:
 
 ```bash
-pip install tabpfn torch scikit-learn imbalanced-learn pandas numpy tqdm psutil shap
+pip install tabpfn torch scikit-learn xgboost imbalanced-learn shap pandas numpy tqdm psutil
 ```
 
-### Hardware
-The TabPFN ensemble was trained on an **NVIDIA A100-PCIE-40GB** GPU.
-A CUDA-capable GPU with ≥ 16 GB VRAM is recommended; the code falls back to
-CPU if no GPU is available (substantially slower).
-
-### TabPFN model weights
-Download the TabPFN v2.5 checkpoint and place it at:
-
-```
-./tabpfn_weights/tabpfn-v2.5-classifier-v2.5_default.ckpt
-```
-
-Or update `MODEL_PATH` in `tabpfn_config.py` to point to your local copy.
-
----
-
-## Usage
-
-Run the scripts in the following order.
-
-### Step 1 — Household member mapping
-
-```bash
-python household_mapping.py
-```
-
-**Input:** `Features_Selected_Data/HushallPerson_2019.csv`  
-**Output:** `Feature_Tables/household_member.csv`
-
-Reads the person-household linkage table, filters out households outside
-the valid size range [1, 200], and writes a wide-format CSV where each row
-is a household and each column (`member_1`, `member_2`, …) holds one member ID.
-
----
-
-### Step 2 — Feature engineering
-
-```bash
-python feature_engineering.py
-```
-
-**Input:**
-- `Feature_Tables/Raw_Feature_Secondary_Case.csv` (person-level features)
-- `Feature_Tables/household_member.csv` (output of Step 1)
-
-**Output:** `Encoded_Household_Features_Full/`
-- `train_fold_{1..5}.csv`
-- `val_fold_{1..5}.csv`
-- `test_fold_{1..5}.csv`
-- `folds_info.txt`
-
-The pipeline:
-1. Aggregates person-level demographic, socio-economic, and clinical count
-   features to household level (age, income, housing, TRYGG vulnerability
-   scores, prescription and diagnosis counts).
-2. Encodes categorical variables (label encoding, frequency encoding,
-   one-hot encoding).
-3. Applies log1p transforms to skewed continuous features.
-4. Selects clinical binary features via chi-square test
-   (p < 0.02, max-frequency < 0.95).
-5. Standardises continuous features with `StandardScaler` fitted on each
-   training fold.
-6. Exports stratified 5-fold splits (90 % train+val / 10 % test).
-
-Key configuration parameters (edit `Config` class in `feature_engineering.py`):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `TEST_SIZE` | 0.1 | Fraction held out as test set |
-| `N_FOLDS` | 5 | Number of cross-validation folds |
-| `CHI2_P_VALUE_THRESHOLD` | 0.02 | Chi-square significance threshold |
-| `MISSING_RATE_THRESHOLD` | 20 | Max % missing before dropping a column |
-
----
-
-### Step 3a — TabPFN ensemble training
-
-Edit `tabpfn_config.py` to set paths and hyperparameters, then run your
-own training script that imports `TabPFNEnsemble` from `tabpfn_ensemble.py`.
-
-Key configuration sections in `tabpfn_config.py`:
-
-**Bagging strategy (`ENSEMBLE_CONFIG`):**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `n_bags` | 8 | Number of base TabPFN models |
-| `bag_sample_size` | 40,000 | Training tokens per bag |
-| `bagging_strategy` | `'stratified_random'` | Bag partitioning method |
-| `balance_strategy` | `'combined'` | Class-balance method within bags |
-| `target_ratio` | 0.6 | Target minority-class fraction per bag |
-| `ensemble_method` | `'soft_voting'` | Aggregation method |
-
-**SHAP explainability (`SHAP_CONFIG`):**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `strategy` | `'representative'` | SHAP computation strategy |
-| `n_background` | 50 | Background samples for KernelExplainer |
-| `n_explain_global` | 1,000 | Samples for global importance estimation |
-
-Example training snippet:
+The TabPFN v2.5 `large-samples` checkpoint can be specified via the `MODEL_PATH` variable in `config.py`:
 
 ```python
-from tabpfn_config import TABPFN_PARAMS, ENSEMBLE_CONFIG, TABPFN_MAX_SAMPLES, TABPFN_MAX_FEATURES
-from tabpfn_ensemble import TabPFNEnsemble
-
-ensemble = TabPFNEnsemble(
-    config=ENSEMBLE_CONFIG,
-    tabpfn_params=TABPFN_PARAMS,
-    max_samples=TABPFN_MAX_SAMPLES,
-    max_features=TABPFN_MAX_FEATURES,
-)
-ensemble.fit(X_train, y_train, feature_names)
-proba = ensemble.predict_proba(X_test, feature_names)
+MODEL_PATH = './tabpfn_weights/tabpfn-v2.5-classifier-v2.5_default.ckpt'
 ```
 
 ---
 
-### Step 3b — Random Forest baseline
+## Expected Directory Layout After Full Pipeline
 
-```bash
-python random_forest_baseline.py
 ```
-
-**Input:** `Encoded_Household_Features_Full/` (output of Step 2)  
-**Output:** `RF_results_balanced/`
-
-Trains a 200-tree Random Forest across all 5 folds with configurable
-imbalance handling.  Evaluation is performed on a stratified 50 % positive
-subset of 4,000 samples to match the TabPFN evaluation protocol.
-
-Change `IMBALANCE_STRATEGY` at the top of the script to try different
-handling approaches (`'class_weight'`, `'smote'`, `'undersample'`, etc.).
-
----
-
-## Experimental Setup
-
-| Setting | Value |
-|---------|-------|
-| Dataset period | Pre-vaccination, 2020 |
-| Total households | 252,472 |
-| Positive class (secondary transmission) | 18.8 % |
-| Features | 295 (after selection) |
-| Train / test split | 90 % / 10 % |
-| Evaluation subset | n = 4,000, 50 % positive |
-| TabPFN bags | K = 8 |
-| Samples per bag | 40,000 |
-| Positive ratio per bag | 60 % |
-| GPU | NVIDIA A100-PCIE-40GB |
-| Training time (TabPFN ensemble) | ~160 s |
-
----
-
-## Key Results (test set, 5-fold mean ± SD)
-
-| Model | Recall₊ | F1₊ | MCC | Macro AUC |
-|-------|---------|-----|-----|-----------|
-| TabPFN Ensemble | 0.905 ± 0.016 | 0.677 ± 0.003 | 0.186 ± 0.003 | 0.626 ± 0.002 |
-| Random Forest | — | — | — | — |
-| XGBoost | — | — | — | 0.627 |
-
----
-
-## Data Availability
-
-The underlying Swedish register data (SWECOV) are not publicly available
-owing to patient privacy regulations.  Code is provided for methodological
-transparency; researchers with access to equivalent national register data
-may adapt the pipeline accordingly.
-
----
-
-## License
-
-This code is released for research purposes. See `LICENSE` for details.
+.
+├── Time_Filtered_Data/              # Step 1 output: time-filtered CSVs
+├── Features_Selected_Data/          # Step 1 output: selected-feature CSVs + pickle dicts
+├── Index(InD=14,ExD=2)/             # Step 1 output: population index pickles
+├── PopIndex/                        # Step 1 output: infected/healthy classification
+├── Feature_Tables/                  # Steps 2–3 output: household map + raw feature CSV
+├── Household_Features/              # Step 4 intermediate: unaggregated household table
+├── Encoded_Household_Features_Full/ # Step 4 output: k-fold train/val/test CSVs
+├── TabPFN_XAI_Results_Full/         # Steps 5a–5b output: metrics, SHAP plots, PI charts
+├── LR_results_balanced_Full_2/      # Logistic Regression results
+├── RF_results_balanced_Full_2/      # Random Forest results
+└── XGB_results_balanced_Full_2/     # XGBoost results
+```
