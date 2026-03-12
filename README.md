@@ -2,7 +2,7 @@
 
 Source code for the paper:
 
-> **Household SARS-CoV-2 Secondary Transmission Risk Prediction Using TabPFN with Explainability on Swedish National Register Data**
+> **Household SARS-CoV-2 Secondary Transmission Risk Prediction  for Swedish National Register Data Using TabPFN with Explainability**
 
 ## Overview
 
