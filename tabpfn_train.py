@@ -5,18 +5,16 @@ TabPFN ensemble training and evaluation script with 5-fold cross-validation.
 
 This script is the direct counterpart to ``baseline_logistic_regression.py``,
 ``baseline_random_forest.py``, and ``baseline_xgboost.py``.  It trains the
-TabPFN bagging ensemble described in the paper and evaluates it under the same
-protocol used for all baselines: a balanced held-out subset drawn from the test
-fold (n = 4,000, 50 % positive, without replacement).
+TabPFN bagging ensemble described in the paper and evaluates it on the full
+natural-distribution test fold.
 
 Key design decisions
 --------------------
 - **Training context oversampling:** each of the *K* = 8 bags is sampled with a
   60 % positive ratio (24,000 positive + 16,000 negative), pushing the model's
   in-context prior toward the minority class and achieving Recall₊ = 0.905.
-- **Shared evaluation set:** a single balanced eval sample is drawn once per
-  fold and reused across all bags, making per-bag and ensemble metrics directly
-  comparable.
+- **Shared evaluation set:** the full test fold is used for evaluation, preserving
+  the natural class distribution and making metrics directly interpretable.
 - **Soft-voting:** the ensemble probability is the arithmetic mean of all bag
   predicted probabilities.
 - **No data leakage:** the validation fold is kept strictly separate from the
@@ -67,11 +65,8 @@ CV_CONFIG = {
     # Bagging configuration
     'n_bags': 8,                            # Number of independent bags
     'bag_train_size': 40000,                # Training samples per bag
-    'bag_eval_size': 4000,                  # Val/Test samples per bag (each)
-
     # Class ratio configuration
     'train_pos_ratio': 0.6,                 # 60% positive in training bags
-    'eval_pos_ratio':  0.5,                 # 50% positive in val/test bags
 
     # Ensemble
     'ensemble_method': 'soft_voting',
@@ -94,7 +89,7 @@ print("="*80)
 print(f"  Folds:            {CV_CONFIG['folds_to_run']}")
 print(f"  Bags/fold:        {CV_CONFIG['n_bags']}")
 print(f"  Train size/bag:   {CV_CONFIG['bag_train_size']:,}  ({CV_CONFIG['train_pos_ratio']*100:.0f}% positive)")
-print(f"  Eval size/bag:    {CV_CONFIG['bag_eval_size']:,}  (50% positive)")
+print("  Eval:             full natural-distribution test set")
 print(f"  Ensemble method:  {CV_CONFIG['ensemble_method']}")
 print(f"  Device:           {TABPFN_MODEL_PARAMS['device']}")
 print("="*80 + "\n")
@@ -288,17 +283,11 @@ def run_bagging_ensemble(
     print(f"Bagging Ensemble — evaluating on {eval_tag}")
     print(f"{'='*80}")
 
-    # ── Sample eval set (shared across all bags) ──────────────────────────
-    print(f"\n  Sampling {eval_tag} set (shared across bags):")
-    eval_sample = sample_with_ratio(
-        eval_df,
-        config['bag_eval_size'],
-        config['eval_pos_ratio'],
-        random_state=config['random_state'] + 9999,
-        tag=eval_tag,
-    )
-    X_eval = eval_sample[feature_names].values
-    y_eval = eval_sample['label'].values
+    # ── Use full eval set (natural distribution) ─────────────────────────
+    X_eval = eval_df[feature_names].values
+    y_eval = eval_df['label'].values
+    print(f"\n  Eval set ({eval_tag}): {len(y_eval):,} samples  "
+          f"pos={y_eval.mean():.1%} (natural distribution)")
 
     # ── Per-bag loop ───────────────────────────────────────────────────────
     all_proba   = []
@@ -350,9 +339,7 @@ def run_bagging_ensemble(
     ensemble_metrics.update({
         'n_bags':             config['n_bags'],
         'bag_train_size':     config['bag_train_size'],
-        'bag_eval_size':      config['bag_eval_size'],
         'train_pos_ratio':    config['train_pos_ratio'],
-        'eval_pos_ratio':     config['eval_pos_ratio'],
         'ensemble_method':    config['ensemble_method'],
         'total_fit_time':     total_fit_time,
         'avg_fit_time':       total_fit_time / config['n_bags'],
