@@ -8,23 +8,18 @@ Trains a Random Forest (n_estimators=200, max_depth=15) classifier on the strati
 ``feature_aggregation.py`` using ``class_weight='balanced'`` (or
 ``scale_pos_weight`` for XGBoost) to handle the ~4:1 class imbalance.
 
-To ensure comparability with the TabPFN ensemble, evaluation is performed on a
-balanced held-out subset drawn from the test fold (n = 4 000, 50 % positive,
-without replacement).  This protocol eliminates the confounding effect of class
-imbalance on reported metrics.
-
 Metrics reported per fold and averaged across 5 folds
 ------------------------------------------------------
 - Macro AUC, Macro F1, Weighted F1, Balanced Accuracy, MCC
 - Class-1 (secondary transmission present): Precision, Recall, F1, AUC
 - Cohen Kappa, Log Loss
 
-Outputs written to ``RF_results_balanced_Full_2/``
+Outputs written to ``RF_results_Full/``
 -----------------------------------------
-- ``RF_results_balanced_Full_2/household_rf_summary.csv``       per-fold metric summary
-- ``RF_results_balanced_Full_2/household_rf_top50_features.csv`` mean feature importances
-- ``RF_results_balanced_Full_2/household_rf_full_results.json``  complete result dump
-- ``RF_results_balanced_Full_2/rf_model_fold_{k}.joblib``       serialised model (k=1..5)
+- ``RF_results_Full/household_rf_summary.csv``       per-fold metric summary
+- ``RF_results_Full/household_rf_top50_features.csv`` mean feature importances
+- ``RF_results_Full/household_rf_full_results.json``  complete result dump
+- ``RF_results_Full/rf_model_fold_{k}.joblib``       serialised model (k=1..5)
 
 Usage
 -----
@@ -39,9 +34,6 @@ from sklearn.metrics import (roc_auc_score, average_precision_score,
                              classification_report, confusion_matrix,
                              log_loss, balanced_accuracy_score, 
                              cohen_kappa_score, matthews_corrcoef)
-from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
-from imblearn.under_sampling import RandomUnderSampler, TomekLinks
-from imblearn.combine import SMOTETomek, SMOTEENN
 import os
 import json
 import joblib
@@ -49,7 +41,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== CONFIGURATION ====================
-output_dir = 'RF_results_balanced_Full_2/'
+output_dir = 'RF_results_Full/'
 os.makedirs(output_dir, exist_ok=True)
 
 deleted_cols = []
@@ -61,13 +53,6 @@ IMBALANCE_STRATEGY = 'class_weight'
 
 # Target balance ratio for sampling methods (None = auto balance)
 SAMPLING_RATIO = 0.8
-
-# ── Balanced evaluation configuration (matches TabPFN protocol) ──────────────
-EVAL_CONFIG = {
-    'eval_size':      4000,   # samples per eval set (val / test)
-    'eval_pos_ratio': 0.5,    # 50 % positive in each eval set
-    'random_state':   42,
-}
 
 rf_params = {
     'n_estimators': 200,
@@ -109,53 +94,6 @@ def load_and_preprocess(fold: int):
     feature_names = X_train.columns.tolist()
     return X_train, y_train, X_val, y_val, X_test, y_test, feature_names
 
-
-# ── NEW: balanced evaluation sampling ─────────────────────────────────────────
-def sample_balanced_eval(X: np.ndarray, y: np.ndarray,
-                         eval_size: int, pos_ratio: float,
-                         random_state: int, tag: str = '') -> tuple:
-    """
-    Sample a balanced subset from an evaluation set.
-
-    Parameters
-    ----------
-    X            : feature array (already imputed)
-    y            : label array
-    eval_size    : total number of samples to draw
-    pos_ratio    : target fraction of positives  (e.g. 0.5)
-    random_state : numpy random seed
-    tag          : label for log messages
-
-    Returns
-    -------
-    X_sampled, y_sampled
-    """
-    np.random.seed(random_state)
-
-    n_pos_target = int(eval_size * pos_ratio)
-    n_neg_target = eval_size - n_pos_target
-
-    pos_idx = np.where(y == 1)[0]
-    neg_idx = np.where(y == 0)[0]
-
-    if len(pos_idx) < n_pos_target:
-        print(f"    WARNING [{tag}]: pos requested {n_pos_target} > available {len(pos_idx)}")
-        n_pos_target = len(pos_idx)
-        n_neg_target = eval_size - n_pos_target
-
-    if len(neg_idx) < n_neg_target:
-        print(f"    WARNING [{tag}]: neg requested {n_neg_target} > available {len(neg_idx)}")
-        n_neg_target = len(neg_idx)
-        n_pos_target = eval_size - n_neg_target
-
-    chosen_pos = np.random.choice(pos_idx, n_pos_target, replace=False)
-    chosen_neg = np.random.choice(neg_idx, n_neg_target, replace=False)
-    chosen     = np.concatenate([chosen_pos, chosen_neg])
-    np.random.shuffle(chosen)
-
-    actual_pos_ratio = (y[chosen] == 1).mean()
-    print(f"    [{tag}] sampled {len(chosen)} samples  pos={actual_pos_ratio:.1%}")
-    return X[chosen], y[chosen]
 
 
 def apply_imbalance_handling(X_train, y_train, strategy='smote', sampling_ratio=None):
@@ -233,7 +171,7 @@ def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
 # ==================== MAIN TRAINING LOOP ====================
 print("\n" + "="*80)
 print(f"Random Forest Training with Imbalance Handling: {IMBALANCE_STRATEGY.upper()}")
-print(f"Evaluation: balanced subset  size={EVAL_CONFIG['eval_size']}  pos_ratio={EVAL_CONFIG['eval_pos_ratio']:.0%}")
+print("Evaluation: full (natural distribution) val and test sets")
 print("="*80)
 
 all_fold_results       = []
@@ -257,23 +195,6 @@ for fold in range(1, 6):
         sampling_ratio=SAMPLING_RATIO if IMBALANCE_STRATEGY not in ['none', 'class_weight'] else None,
     )
 
-    # ── NEW: sample balanced eval subsets ─────────────────────────────────
-    print(f"\n  Sampling balanced evaluation subsets:")
-    X_val_bal, y_val_bal = sample_balanced_eval(
-        X_val_imp, y_val.values,
-        eval_size=EVAL_CONFIG['eval_size'],
-        pos_ratio=EVAL_CONFIG['eval_pos_ratio'],
-        random_state=EVAL_CONFIG['random_state'],
-        tag='Val',
-    )
-    X_test_bal, y_test_bal = sample_balanced_eval(
-        X_test_imp, y_test.values,
-        eval_size=EVAL_CONFIG['eval_size'],
-        pos_ratio=EVAL_CONFIG['eval_pos_ratio'],
-        random_state=EVAL_CONFIG['random_state'],
-        tag='Test',
-    )
-
     # Set model parameters
     current_params = rf_params.copy()
     if IMBALANCE_STRATEGY == 'class_weight':
@@ -288,18 +209,18 @@ for fold in range(1, 6):
     if hasattr(model, 'oob_score_'):
         print(f"  OOB Score: {model.oob_score_:.4f}")
 
-    # ── Evaluate on balanced subsets ──────────────────────────────────────
-    val_prob    = model.predict_proba(X_val_bal)[:, 1]
-    val_pred    = model.predict(X_val_bal)
-    val_metrics = compute_detailed_metrics(y_val_bal, val_pred, val_prob)
+    # ── Evaluate on full sets ──────────────────────────────────────────────
+    val_prob    = model.predict_proba(X_val_imp)[:, 1]
+    val_pred    = model.predict(X_val_imp)
+    val_metrics = compute_detailed_metrics(y_val.values, val_pred, val_prob)
 
-    test_prob    = model.predict_proba(X_test_bal)[:, 1]
-    test_pred    = model.predict(X_test_bal)
-    test_metrics = compute_detailed_metrics(y_test_bal, test_pred, test_prob)
+    test_prob    = model.predict_proba(X_test_imp)[:, 1]
+    test_pred    = model.predict(X_test_imp)
+    test_metrics = compute_detailed_metrics(y_test.values, test_pred, test_prob)
 
     # Print results
     print(f"\n{'='*60}")
-    print(f"FOLD {fold} - VALIDATION SET RESULTS (balanced {EVAL_CONFIG['eval_pos_ratio']:.0%} pos):")
+    print(f"FOLD {fold} - VALIDATION SET RESULTS (full set):")
     print(f"{'='*60}")
     print(f"Macro AUC:        {val_metrics['macro_auc']:.4f}")
     print(f"Macro F1:         {val_metrics['macro_f1']:.4f}")
@@ -315,7 +236,7 @@ for fold in range(1, 6):
     print(f"  F1:             {val_metrics['class_1_f1']:.4f}")
 
     print(f"\n{'='*60}")
-    print(f"FOLD {fold} - TEST SET RESULTS (balanced {EVAL_CONFIG['eval_pos_ratio']:.0%} pos):")
+    print(f"FOLD {fold} - TEST SET RESULTS (full set):")
     print(f"{'='*60}")
     print(f"Macro AUC:        {test_metrics['macro_auc']:.4f}")
     print(f"Macro F1:         {test_metrics['macro_f1']:.4f}")
@@ -353,9 +274,6 @@ for fold in range(1, 6):
         'n_train_balanced':   len(y_train_balanced),
         'n_val':              len(y_val),
         'n_test':             len(y_test),
-        'n_val_eval':         len(y_val_bal),
-        'n_test_eval':        len(y_test_bal),
-        'eval_pos_ratio':     EVAL_CONFIG['eval_pos_ratio'],
         'imbalance_strategy': IMBALANCE_STRATEGY,
         'oob_score':          model.oob_score_ if hasattr(model, 'oob_score_') else None,
         'val':                val_metrics,
@@ -376,9 +294,6 @@ for r in all_fold_results:
         'imbalance_strategy': r['imbalance_strategy'],
         'n_train_original':   r['n_train_original'],
         'n_train_balanced':   r['n_train_balanced'],
-        'n_val_eval':         r['n_val_eval'],
-        'n_test_eval':        r['n_test_eval'],
-        'eval_pos_ratio':     r['eval_pos_ratio'],
         'oob_score':          r.get('oob_score'),
         # Validation metrics
         'val_macro_auc':    r['val']['macro_auc'],
@@ -419,7 +334,6 @@ full_json_path = os.path.join(output_dir, 'household_rf_full_results.json')
 with open(full_json_path, 'w') as f:
     json.dump({
         'imbalance_strategy': IMBALANCE_STRATEGY,
-        'eval_config':        EVAL_CONFIG,
         'all_folds':          all_fold_results,
         'top_features':       top_importance.to_dict(orient='records'),
     }, f, indent=2)
@@ -427,7 +341,7 @@ with open(full_json_path, 'w') as f:
 # ==================== PRINT SUMMARY ====================
 print("\n" + "="*80)
 print(f"Random Forest (IMBALANCE: {IMBALANCE_STRATEGY.upper()}) — 5-FOLD CV RESULTS")
-print(f"(Evaluated on balanced {EVAL_CONFIG['eval_pos_ratio']:.0%} pos subset, n={EVAL_CONFIG['eval_size']})")
+print("(Evaluated on full natural-distribution sets)")
 print("="*80)
 
 print(f"\n{'='*60}")
