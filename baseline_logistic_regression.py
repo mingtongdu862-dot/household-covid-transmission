@@ -10,7 +10,7 @@ Trains a Logistic Regression (L2 penalty, lbfgs solver) classifier on the strati
 
 Metrics reported per fold and averaged across 5 folds
 ------------------------------------------------------
-- Macro AUC, Macro F1, Weighted F1, Balanced Accuracy, MCC
+- ROC-AUC, Macro F1, Weighted F1, Balanced Accuracy, MCC
 - Class-1 (secondary transmission present): Precision, Recall, F1, AUC
 - Cohen Kappa, Log Loss
 
@@ -149,7 +149,7 @@ def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
     mcc          = matthews_corrcoef(y_true, y_pred)
 
     result = {
-        'macro_auc':          float(auc_macro),
+        'roc_auc':          float(auc_macro),
         'macro_pr_auc':       float(pr_auc_macro),
         'macro_f1':           float(report['macro avg']['f1-score']),
         'weighted_f1':        float(report['weighted avg']['f1-score']),
@@ -222,7 +222,7 @@ for fold in range(1, 6):
     print(f"\n{'='*60}")
     print(f"FOLD {fold} - VALIDATION SET RESULTS (full set):")
     print(f"{'='*60}")
-    print(f"Macro AUC:        {val_metrics['macro_auc']:.4f}")
+    print(f"ROC-AUC:        {val_metrics['roc_auc']:.4f}")
     print(f"Macro F1:         {val_metrics['macro_f1']:.4f}")
     print(f"Weighted F1:      {val_metrics['weighted_f1']:.4f}")
     print(f"Log Loss:         {val_metrics['log_loss']:.4f}")
@@ -238,7 +238,7 @@ for fold in range(1, 6):
     print(f"\n{'='*60}")
     print(f"FOLD {fold} - TEST SET RESULTS (full set):")
     print(f"{'='*60}")
-    print(f"Macro AUC:        {test_metrics['macro_auc']:.4f}")
+    print(f"ROC-AUC:        {test_metrics['roc_auc']:.4f}")
     print(f"Macro F1:         {test_metrics['macro_f1']:.4f}")
     print(f"Weighted F1:      {test_metrics['weighted_f1']:.4f}")
     print(f"Log Loss:         {test_metrics['log_loss']:.4f}")
@@ -295,7 +295,7 @@ for r in all_fold_results:
         'n_train_original':   r['n_train_original'],
         'n_train_balanced':   r['n_train_balanced'],
         # Validation metrics
-        'val_macro_auc':    r['val']['macro_auc'],
+        'val_roc_auc':    r['val']['roc_auc'],
         'val_macro_f1':     r['val']['macro_f1'],
         'val_weighted_f1':  r['val']['weighted_f1'],
         'val_log_loss':     r['val']['log_loss'],
@@ -303,7 +303,7 @@ for r in all_fold_results:
         'val_kappa':        r['val']['cohen_kappa'],
         'val_mcc':          r['val']['mcc'],
         # Test metrics
-        'test_macro_auc':    r['test']['macro_auc'],
+        'test_roc_auc':    r['test']['roc_auc'],
         'test_macro_f1':     r['test']['macro_f1'],
         'test_weighted_f1':  r['test']['weighted_f1'],
         'test_log_loss':     r['test']['log_loss'],
@@ -346,7 +346,7 @@ print("="*80)
 print(f"\n{'='*60}")
 print("VALIDATION SET — AVERAGED ACROSS 5 FOLDS:")
 print(f"{'='*60}")
-print(f"Macro AUC:           {summary_df['val_macro_auc'].mean():.4f} ± {summary_df['val_macro_auc'].std():.4f}")
+print(f"ROC-AUC:           {summary_df['val_roc_auc'].mean():.4f} ± {summary_df['val_roc_auc'].std():.4f}")
 print(f"Macro F1:            {summary_df['val_macro_f1'].mean():.4f} ± {summary_df['val_macro_f1'].std():.4f}")
 print(f"Weighted F1:         {summary_df['val_weighted_f1'].mean():.4f} ± {summary_df['val_weighted_f1'].std():.4f}")
 print(f"Log Loss:            {summary_df['val_log_loss'].mean():.4f} ± {summary_df['val_log_loss'].std():.4f}")
@@ -362,7 +362,7 @@ print(f"  Precision:         {summary_df['val_class1_precision'].mean():.4f} ± 
 print(f"\n{'='*60}")
 print("TEST SET — AVERAGED ACROSS 5 FOLDS:")
 print(f"{'='*60}")
-print(f"Macro AUC:           {summary_df['test_macro_auc'].mean():.4f} ± {summary_df['test_macro_auc'].std():.4f}")
+print(f"ROC-AUC:           {summary_df['test_roc_auc'].mean():.4f} ± {summary_df['test_roc_auc'].std():.4f}")
 print(f"Macro F1:            {summary_df['test_macro_f1'].mean():.4f} ± {summary_df['test_macro_f1'].std():.4f}")
 print(f"Weighted F1:         {summary_df['test_weighted_f1'].mean():.4f} ± {summary_df['test_weighted_f1'].std():.4f}")
 print(f"Log Loss:            {summary_df['test_log_loss'].mean():.4f} ± {summary_df['test_log_loss'].std():.4f}")
