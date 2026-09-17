@@ -1,13 +1,25 @@
 """
-TabPFN Ensemble - Training + Inference + Explainability Analysis (V4 + Checkpoint Resume)
+TabPFN Ensemble - Training + Inference + Explainability Analysis (V5 — Ensemble SHAP-only)
 ======================================================================
 
-Changelog (v4-resume → v4-resume-top50):
-  - Added pi_top_n_features config key to SUBGROUP_CONFIG
-  - Subgroup PI now only evaluates the top-N globally ranked features (default: 50)
-  - Time estimate: 295 → 50 features reduces subgroup PI cost by ~83%,
-    total runtime drops from ~82h to ~16h
-  - All other logic (Beeswarm, Local SHAP, checkpointing) is unchanged
+Changelog (v4-resume-top50 -> v5-ensemble-shap):
+  - All explanations (global, subgroup, local) now query the full 8-bag
+    soft-voted ensemble via EnsembleModelAdapter, instead of the single
+    highest-OOB-AUC bag. The explained model now matches the model whose
+    performance is reported (Table 2 / tabpfn_train.py).
+  - Permutation importance is removed everywhere (global and per-subgroup).
+    It required hundreds of full predict_proba calls per feature and did
+    not scale to 295 features x a huge test population, and became even
+    more expensive once every predict_proba call queries 8 bags instead
+    of 1. Global and subgroup feature ranking now comes directly from
+    mean(|SHAP|) on a single joint Kernel SHAP computation (all features
+    at once), which also produces the beeswarm plot.
+  - The quartile x label stratified sampler is removed (it only existed to
+    pick which top-k features to stratify on using the now-removed PI
+    ranking). Explanation/background samples are now drawn by plain
+    label-stratified random sampling.
+  - Local SHAP (waterfall plots, checkpointing) is functionally unchanged,
+    aside from using the ensemble adapter and SHAP-based top-feature list.
 """
 
 import pandas as pd
@@ -21,8 +33,6 @@ import shap
 import os
 import json
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import seaborn as sns
 import time
 import torch
 import warnings
@@ -32,22 +42,37 @@ from config import *
 from tabpfn_ensemble import TabPFNEnsemble
 
 # ===========================================================================
+# ENSEMBLE MODEL ADAPTER
+# ===========================================================================
+
+class EnsembleModelAdapter:
+    """
+    Wraps a fitted TabPFNEnsemble behind a single-argument `.predict_proba(X)`
+    method, so PI/SHAP code can treat it exactly like one sklearn-style model
+    while every call actually soft-votes across all bags. This is what makes
+    the explanations below refer to the same decision function whose
+    performance is reported for Table 2, rather than one representative bag.
+    """
+
+    def __init__(self, ensemble, feature_names, batch_size=None):
+        self.ensemble = ensemble
+        self.feature_names = feature_names
+        self.batch_size = batch_size or PREDICT_BATCH_SIZE
+
+    def predict_proba(self, X):
+        return self.ensemble.predict_proba(X, self.feature_names, batch_size=self.batch_size)
+
+
+# ===========================================================================
 # ANALYSIS CONFIGURATION
 # ===========================================================================
 
-GLOBAL_PI_CONFIG = {
-    'subset_size':   3000,
-    'n_repeats':     5,
-    'top_n_display': 30,
-}
-
-GLOBAL_BEESWARM_CONFIG = {
-    'top_k_features': 10,
-    'n_quartiles':     4,
-    'n_per_cell':      5,
-    'n_background':   30,
-    'max_evals':     100,
-    'batch_size':     50,
+GLOBAL_SHAP_CONFIG = {
+    'n_explain':      1000,   # households sampled (stratified by label) for global SHAP
+    'n_background':     50,
+    'max_evals':       120,
+    'batch_size':        50,
+    'top_n_display':    30,
 }
 
 LOCAL_SHAP_CONFIG = {
@@ -61,20 +86,14 @@ LOCAL_SHAP_CONFIG = {
 }
 
 SUBGROUP_CONFIG = {
-    'pi_subset_size':       1000,
-    'pi_n_repeats':         3,
-    'top_n_display':        20,
-    'pi_top_n_features':    50,    # NEW: subgroup PI only evaluates the global top-N features
-    'beeswarm_top_k':         5,
-    'beeswarm_n_quartiles':   4,
-    'beeswarm_n_per_cell':    4,
-    'beeswarm_n':           100,
-    'beeswarm_max_evals':   100,
-    'beeswarm_n_bg':         30,
+    'n_explain':            100,   # SHAP explanation-sample cap per subgroup
+    'n_background':          30,
+    'max_evals':            100,
+    'top_n_display':         20,
     'local_n_per_label':      3,
     'local_n_per_feat':       2,
     'local_n_top_feats':      3,
-    'local_max_evals':       100,
+    'local_max_evals':      100,
     'local_n_background':    30,
     'min_size':              30,
 }
@@ -84,76 +103,54 @@ SUBGROUP_CONFIG = {
 # REMAINING TIME ESTIMATION
 # ===========================================================================
 
-def estimate_remaining_time(feature_names, n_subgroups=11,
-                            global_pi_done=False, global_bee_batches_done=0,
-                            global_bee_total_batches=0):
+def estimate_remaining_time(global_shap_done=False, global_bee_batches_done=0,
+                            global_bee_total_batches=0, n_subgroups=11):
     """
-    Estimate remaining wall-clock time per stage based on empirical per-call timings.
-    Subgroup PI estimate accounts for the top-N feature filter in SUBGROUP_CONFIG.
+    Rough wall-clock estimate for the SHAP-only pipeline. Every predict_proba
+    call now queries the full 8-bag ensemble instead of one bag (~8x more
+    model forward passes per call than the earlier best-bag-only pipeline),
+    but permutation importance -- previously the dominant cost, hundreds of
+    full-dataset predict_proba calls -- is removed entirely, so the net
+    effect is normally a large reduction in total runtime.
     """
-    n_feat = len(feature_names)
-    min_per_call_3k = 2129.0 / (n_feat * GLOBAL_PI_CONFIG['n_repeats'])
-    scale_1k = 1000.0 / 3000.0
-
-    bee_samples = (GLOBAL_BEESWARM_CONFIG['top_k_features'] *
-                   GLOBAL_BEESWARM_CONFIG['n_quartiles'] * 2 *
-                   GLOBAL_BEESWARM_CONFIG['n_per_cell'])
-    bee_total_batches = (bee_samples + GLOBAL_BEESWARM_CONFIG['batch_size'] - 1) \
-                        // GLOBAL_BEESWARM_CONFIG['batch_size']
-    min_per_bee_batch = 5.0
+    min_per_batch = 5.0  # empirical minutes per 50-sample Kernel SHAP batch
 
     print(f"\n{'='*80}")
-    print("⏱  Remaining Time Estimation")
+    print("Remaining Time Estimation")
     print(f"{'='*80}")
-    print(f"  Baseline: per model call ({3000} samples) ≈ {min_per_call_3k:.2f} min")
-    print(f"            scaled to 1000 samples ≈ {min_per_call_3k*scale_1k:.2f} min/call\n")
 
     total_min = 0.0
 
-    # Global PI
-    if not global_pi_done:
-        pi_min = n_feat * GLOBAL_PI_CONFIG['n_repeats'] * min_per_call_3k
-        print(f"  Global PI           : {pi_min:.0f} min  ({pi_min/60:.1f} h)")
-        total_min += pi_min
+    # Global SHAP (beeswarm + ranking, one joint computation)
+    if not global_shap_done:
+        bee_remaining = max(0, global_bee_total_batches - global_bee_batches_done)
+        global_min = bee_remaining * min_per_batch
+        print(f"  Global SHAP         : {global_min:.0f} min  "
+              f"({global_bee_batches_done}/{global_bee_total_batches} batches done)")
+        total_min += global_min
     else:
-        print(f"  Global PI           : ✅ Already done (skipped)")
+        print(f"  Global SHAP         : already done (skipped)")
 
-    # Global Beeswarm
-    bee_remaining = max(0, bee_total_batches - global_bee_batches_done)
-    bee_min = bee_remaining * min_per_bee_batch
-    status = f"({global_bee_batches_done}/{bee_total_batches} batches done, {bee_remaining} remaining)"
-    print(f"  Global Beeswarm     : {bee_min:.0f} min  {status}")
-    total_min += bee_min
-
-    # Global local SHAP
+    # Local SHAP
     local_samples = (LOCAL_SHAP_CONFIG['n_per_outcome'] * 4 +
                      LOCAL_SHAP_CONFIG['n_per_feat_value'] * 2 *
                      LOCAL_SHAP_CONFIG['n_top_features'] * 2)
     local_batches = (local_samples + LOCAL_SHAP_CONFIG['batch_size'] - 1) \
                     // LOCAL_SHAP_CONFIG['batch_size']
-    local_min = local_batches * min_per_bee_batch
-    print(f"  Global Local SHAP   : {local_min:.0f} min  (~{local_samples} samples)")
+    local_min = local_batches * min_per_batch
+    print(f"  Local SHAP          : {local_min:.0f} min  (~{local_samples} samples)")
     total_min += local_min
 
-    # Subgroup analysis — use filtered feature count for PI estimate
-    n_sg_feat = SUBGROUP_CONFIG.get('pi_top_n_features', n_feat)
-    sg_pi_calls_per_sg = n_sg_feat * SUBGROUP_CONFIG['pi_n_repeats']
-    sg_pi_min_per_sg = sg_pi_calls_per_sg * min_per_call_3k * scale_1k
-    sg_bee_batches = (SUBGROUP_CONFIG['beeswarm_n'] + 49) // 50
-    sg_bee_min_per_sg = sg_bee_batches * min_per_bee_batch
-    sg_local_min_per_sg = 2 * min_per_bee_batch
-    sg_total_per_sg = sg_pi_min_per_sg + sg_bee_min_per_sg + sg_local_min_per_sg
-    sg_total = sg_total_per_sg * n_subgroups
-
-    print(f"  Subgroup PI features: {n_sg_feat} (top-N filtered from {n_feat} total)")
-    print(f"  Subgroup PI (each)  : {sg_pi_min_per_sg:.0f} min  ({sg_pi_min_per_sg/60:.1f} h)")
-    print(f"  Subgroup Beeswarm   : {sg_bee_min_per_sg:.0f} min/group")
-    print(f"  Subgroup total ({n_subgroups}): {sg_total:.0f} min  ({sg_total/60:.1f} h)")
+    # Subgroup SHAP (beeswarm + local, per subgroup)
+    sg_bee_batches   = (SUBGROUP_CONFIG['n_explain'] + 49) // 50
+    sg_min_per_sg    = sg_bee_batches * min_per_batch + 2 * min_per_batch
+    sg_total         = sg_min_per_sg * n_subgroups
+    print(f"  Subgroup SHAP ({n_subgroups}): {sg_total:.0f} min  ({sg_total/60:.1f} h)")
     total_min += sg_total
 
     print(f"\n  {'─'*50}")
-    print(f"  📌 Total remaining  : {total_min:.0f} min  ({total_min/60:.1f} h)")
-    print(f"  📌 Recommended node : {total_min/60*1.2:.0f} h  (+20% buffer)")
+    print(f"  Total remaining    : {total_min:.0f} min  ({total_min/60:.1f} h)")
+    print(f"  Recommended node   : {total_min/60*1.2:.0f} h  (+20% buffer)")
     print(f"{'='*80}\n")
     return total_min
 
@@ -217,56 +214,6 @@ def compute_detailed_metrics(y_true, y_pred, y_prob):
 
 
 # ===========================================================================
-# PERMUTATION IMPORTANCE
-# ===========================================================================
-
-def compute_permutation_importance(model, X, y, feature_names,
-                                   n_repeats=5, subset_size=None,
-                                   random_state=42):
-    rng = np.random.default_rng(random_state)
-
-    if subset_size is not None and subset_size < len(X):
-        idx = rng.choice(len(X), size=subset_size, replace=False)
-        X_use = X.iloc[idx].reset_index(drop=True)
-        y_use = y[idx]
-        print(f"    PI subset: {len(X_use):,} / {len(X):,}")
-    else:
-        X_use = X.reset_index(drop=True)
-        y_use = y
-
-    baseline_prob = model.predict_proba(X_use)[:, 1]
-    baseline_auc  = roc_auc_score(y_use, baseline_prob)
-    print(f"    Baseline AUC: {baseline_auc:.4f}")
-
-    n_features = len(feature_names)
-    all_drops  = np.zeros((n_features, n_repeats))
-
-    t0 = time.time()
-    for fi, feat in enumerate(feature_names):
-        for r in range(n_repeats):
-            X_perm = X_use.copy()
-            X_perm[feat] = rng.permutation(X_perm[feat].values)
-            perm_prob = model.predict_proba(X_perm)[:, 1]
-            perm_auc  = roc_auc_score(y_use, perm_prob)
-            all_drops[fi, r] = baseline_auc - perm_auc
-
-        elapsed = time.time() - t0
-        eta = elapsed / (fi + 1) * (n_features - fi - 1)
-        print(f"\r    [{fi+1:3d}/{n_features}] {feat[:35]:35s} "
-              f"mean_drop={all_drops[fi].mean():.4f}  "
-              f"ETA {eta/60:.1f} min", end='', flush=True)
-    print()
-
-    importance_df = pd.DataFrame({
-        'feature':          feature_names,
-        'mean_importance':  all_drops.mean(axis=1),
-        'std_importance':   all_drops.std(axis=1),
-    }).sort_values('mean_importance', ascending=False).reset_index(drop=True)
-    importance_df['rank'] = np.arange(1, len(importance_df) + 1)
-    return importance_df
-
-
-# ===========================================================================
 # SHAP WITH BATCH-LEVEL CHECKPOINTS
 # ===========================================================================
 
@@ -296,14 +243,15 @@ def compute_shap_small_with_checkpoint(model, X_explain, X_background,
             break
 
     if first_pending == n_batch:
-        print(f"    ✅ SHAP checkpoints complete ({n_batch} batches), loading directly")
+        print(f"    SHAP checkpoints complete ({n_batch} batches), loading directly")
         return np.vstack([np.load(fp) for fp in batch_files])
 
     if first_pending > 0:
-        print(f"    ♻️  Resuming from batch {first_pending+1}/{n_batch} "
+        print(f"    Resuming from batch {first_pending+1}/{n_batch} "
               f"({first_pending} batches already done)")
 
-    print(f"    SHAP: {n} samples × {max_evals} evals × {len(X_background)} background")
+    print(f"    SHAP: {n} samples x {max_evals} evals x {len(X_background)} background "
+          f"(ensemble, all bags)")
 
     predict_fn = lambda x: model.predict_proba(x)[:, 1]
     explainer  = shap.KernelExplainer(predict_fn, X_background, link='identity')
@@ -323,184 +271,156 @@ def compute_shap_small_with_checkpoint(model, X_explain, X_background,
             torch.cuda.empty_cache()
 
     elapsed = time.time() - t0
-    print(f"\n    → New batches complete, elapsed {elapsed/60:.1f} min")
+    print(f"\n    -> New batches complete, elapsed {elapsed/60:.1f} min")
 
     return np.vstack([np.load(fp) for fp in batch_files])
 
 
-def _quartile_label_sample(X, y, pi_feature_order, feature_names,
-                           top_k=10, n_quartiles=4, n_per_cell=5,
-                           random_state=42):
+def _stratified_sample(X, y, n, random_state=42):
     """
-    Build a stratified explanation pool by crossing feature quartile buckets
-    with class labels. Returns a representative subset for beeswarm SHAP.
+    Draw a size-n sample of households, stratified by label when possible.
+    Falls back to plain random sampling for single-class groups or when a
+    stratified split cannot be formed. Returns (X_sample, y_sample) with a
+    reset, contiguous index.
     """
-    rng      = np.random.default_rng(random_state)
-    X_reset  = X.reset_index(drop=True)
-    chosen   = set()
-    top_feats = [f for f in pi_feature_order if f in X_reset.columns][:top_k]
+    X_reset = X.reset_index(drop=True)
+    if n >= len(X_reset):
+        return X_reset, y
 
-    for feat in top_feats:
-        vals = X_reset[feat].values.astype(float)
-        boundaries = np.unique(
-            np.nanpercentile(vals, np.linspace(0, 100, n_quartiles + 1)))
-        if len(boundaries) < 2:
-            boundaries = np.array([vals.min()-1e-9, np.median(vals), vals.max()+1e-9])
-        buckets = np.digitize(vals, boundaries[1:-1])
-        for b in range(len(boundaries) - 1):
-            b_mask = buckets == b
-            for lab in np.unique(y):
-                lab_mask = y == lab
-                cell_idx = np.where(b_mask & lab_mask)[0]
-                if len(cell_idx) == 0:
-                    continue
-                k = min(n_per_cell, len(cell_idx))
-                chosen.update(rng.choice(cell_idx, k, replace=False).tolist())
+    rng = np.random.default_rng(random_state)
+    if len(np.unique(y)) < 2:
+        idx = rng.choice(len(X_reset), size=n, replace=False)
+    else:
+        try:
+            idx, _ = train_test_split(
+                np.arange(len(X_reset)), train_size=n,
+                stratify=y, random_state=random_state)
+        except ValueError:
+            idx = rng.choice(len(X_reset), size=n, replace=False)
 
-    chosen = sorted(chosen)
-    print(f"    Beeswarm stratified pool: {len(chosen)} samples "
-          f"(top-{top_k} features × {n_quartiles} quartiles × 2 labels × {n_per_cell}/cell)")
-    return X_reset.iloc[chosen].reset_index(drop=True), y[chosen]
+    idx = np.sort(idx)
+    return X_reset.iloc[idx].reset_index(drop=True), y[idx]
+
+
+def _shap_bar_chart(shap_df, title, out_path, top_n):
+    """Mean |SHAP| bar chart, coloured by the sign of mean SHAP (direction)."""
+    top = shap_df.head(top_n)
+    colors = ['#d62728' if v >= 0 else '#1f77b4' for v in top['mean_shap']]
+    fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.35)))
+    ax.barh(range(len(top)), top['mean_abs_shap'], xerr=top['std_abs_shap'],
+            color=colors, ecolor='gray', capsize=3, alpha=0.85)
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(top['feature'], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel('Mean |SHAP value|', fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _shap_beeswarm(shap_matrix, X_explain, ordered_features, title, out_path, top_n):
+    feat_index = {f: i for i, f in enumerate(X_explain.columns)}
+    ordered_idx   = [feat_index[f] for f in ordered_features if f in feat_index][:top_n]
+    ordered_names = [X_explain.columns[i] for i in ordered_idx]
+
+    fig, ax = plt.subplots(figsize=(12, max(6, len(ordered_names) * 0.45)))
+    plt.sca(ax)
+    shap.summary_plot(
+        shap_matrix[:, ordered_idx], X_explain[ordered_names],
+        feature_names=ordered_names, max_display=len(ordered_names),
+        plot_type='dot', show=False)
+    ax = plt.gca()
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
 
 
 # ===========================================================================
 # GLOBAL ANALYSIS WITH CHECKPOINT RESUME
 # ===========================================================================
 
-def global_feature_analysis(model, X_test, y_test, feature_names,
-                             pi_cfg=GLOBAL_PI_CONFIG,
-                             beeswarm_cfg=GLOBAL_BEESWARM_CONFIG,
-                             save_dir=None):
+def global_shap_analysis(model, X_test, y_test, feature_names,
+                          cfg=GLOBAL_SHAP_CONFIG, save_dir=None):
+    """
+    Single joint Kernel SHAP computation over all features on a
+    label-stratified sample of the test set. Produces both the global
+    feature ranking (mean |SHAP|) and the beeswarm plot -- there is no
+    separate permutation-importance pass.
+    """
     print(f"\n{'='*80}")
-    print("GLOBAL FEATURE ANALYSIS")
+    print("GLOBAL SHAP ANALYSIS")
     print(f"{'='*80}")
 
     if save_dir is None:
         save_dir = os.path.join(OUTPUT_DIR, 'global_importance')
     os.makedirs(save_dir, exist_ok=True)
 
-    top_n         = pi_cfg['top_n_display']
-    pi_path       = os.path.join(save_dir, 'pi_feature_importance.csv')
-    bee_path      = os.path.join(save_dir, 'beeswarm.png')
-    bee_shap_path = os.path.join(save_dir, 'beeswarm_shap_values.csv')
-    ckpt_dir      = os.path.join(save_dir, 'shap_checkpoints')
+    top_n     = cfg['top_n_display']
+    shap_csv  = os.path.join(save_dir, 'global_shap_importance.csv')
+    shap_npy  = os.path.join(save_dir, 'global_shap_values.npy')
+    exp_csv   = os.path.join(save_dir, 'global_shap_explain_sample.csv')
+    bee_path  = os.path.join(save_dir, 'beeswarm.png')
+    ckpt_dir  = os.path.join(save_dir, 'shap_checkpoints')
 
-    # ------------------------------------------------------------------ #
-    # 1. Permutation Importance  — skip if CSV checkpoint exists          #
-    # ------------------------------------------------------------------ #
-    if os.path.exists(pi_path):
-        print(f"\n  [1/2] ✅ PI checkpoint found, loading: {pi_path}")
-        pi_df = pd.read_csv(pi_path)
+    X_explain, y_explain = _stratified_sample(X_test, y_test, cfg['n_explain'], random_state=1)
+    X_bg, _              = _stratified_sample(X_test, y_test, cfg['n_background'], random_state=0)
+
+    if os.path.exists(shap_npy) and os.path.exists(shap_csv):
+        print(f"\n  Checkpoint found, loading: {shap_csv}")
+        shap_matrix = np.load(shap_npy)
+        shap_df     = pd.read_csv(shap_csv)
+        X_explain   = pd.read_csv(exp_csv)[feature_names]
     else:
-        print(f"\n  [1/2] Permutation Importance...")
-        t0 = time.time()
-        pi_df = compute_permutation_importance(
-            model, X_test, y_test, feature_names,
-            n_repeats=pi_cfg['n_repeats'],
-            subset_size=pi_cfg['subset_size'])
-        pi_df.to_csv(pi_path, index=False)
-        print(f"  PI done in {(time.time()-t0)/60:.1f} min")
-
-    # Redraw PI bar chart (idempotent)
-    top_pi = pi_df.head(top_n)
-    fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.35)))
-    ax.barh(range(len(top_pi)), top_pi['mean_importance'],
-            xerr=top_pi['std_importance'],
-            color='steelblue', ecolor='gray', capsize=3, alpha=0.85)
-    ax.set_yticks(range(len(top_pi)))
-    ax.set_yticklabels(top_pi['feature'], fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel('Mean AUC drop (permutation)', fontsize=11)
-    ax.set_title(f'Global Feature Importance — Top {top_n}\n'
-                 f'(PI, n={pi_cfg["subset_size"]:,}, {pi_cfg["n_repeats"]} repeats)',
-                 fontsize=12, fontweight='bold')
-    ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'pi_bar.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # ------------------------------------------------------------------ #
-    # 2. Beeswarm SHAP  — resume from batch-level checkpoints             #
-    # ------------------------------------------------------------------ #
-    if os.path.exists(bee_path) and os.path.exists(bee_shap_path):
-        print(f"\n  [2/2] ✅ Beeswarm already exists, skipping")
-        shap_matrix = pd.read_csv(bee_shap_path).values
-        pi_order    = pi_df['feature'].tolist()
-        X_explain, y_explain = _quartile_label_sample(
-            X_test, y_test, pi_feature_order=pi_order,
-            feature_names=feature_names,
-            top_k=beeswarm_cfg['top_k_features'],
-            n_quartiles=beeswarm_cfg['n_quartiles'],
-            n_per_cell=beeswarm_cfg['n_per_cell'], random_state=1)
-    else:
-        print(f"\n  [2/2] Quartile×label stratified SHAP → Beeswarm...")
-        pi_order   = pi_df['feature'].tolist()
-        feat_index = {f: i for i, f in enumerate(feature_names)}
-
-        try:
-            bg_idx, _, _, _ = train_test_split(
-                np.arange(len(X_test)), y_test,
-                train_size=beeswarm_cfg['n_background'],
-                stratify=y_test, random_state=0)
-        except Exception:
-            bg_idx = np.random.default_rng(0).choice(
-                len(X_test), beeswarm_cfg['n_background'], replace=False)
-        X_bg = X_test.reset_index(drop=True).iloc[bg_idx].reset_index(drop=True)
-
-        X_explain, y_explain = _quartile_label_sample(
-            X_test, y_test, pi_feature_order=pi_order,
-            feature_names=feature_names,
-            top_k=beeswarm_cfg['top_k_features'],
-            n_quartiles=beeswarm_cfg['n_quartiles'],
-            n_per_cell=beeswarm_cfg['n_per_cell'], random_state=1)
-
+        print(f"\n  Kernel SHAP over all {len(feature_names)} features "
+              f"(n={len(X_explain):,} households)...")
         t0 = time.time()
         shap_matrix = compute_shap_small_with_checkpoint(
             model, X_explain, X_bg, feature_names,
-            checkpoint_dir=ckpt_dir, prefix='global_bee',
-            max_evals=beeswarm_cfg['max_evals'],
-            batch_size=beeswarm_cfg['batch_size'])
-        print(f"  Beeswarm SHAP done in {(time.time()-t0)/60:.1f} min")
+            checkpoint_dir=ckpt_dir, prefix='global',
+            max_evals=cfg['max_evals'], batch_size=cfg['batch_size'])
+        print(f"  Global SHAP done in {(time.time()-t0)/60:.1f} min")
 
-        pd.DataFrame(shap_matrix, columns=feature_names).to_csv(bee_shap_path, index=False)
+        mean_abs_shap = np.abs(shap_matrix).mean(axis=0)
+        std_abs_shap  = np.abs(shap_matrix).std(axis=0)
+        mean_shap     = shap_matrix.mean(axis=0)
+        shap_df = pd.DataFrame({
+            'feature':        feature_names,
+            'mean_abs_shap':  mean_abs_shap,
+            'std_abs_shap':   std_abs_shap,
+            'mean_shap':      mean_shap,
+        }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
+        shap_df['rank'] = np.arange(1, len(shap_df) + 1)
 
-        ordered_idx   = [feat_index[f] for f in pi_order[:top_n] if f in feat_index]
-        ordered_names = [feature_names[i] for i in ordered_idx]
-        shap_reordered = shap_matrix[:, ordered_idx]
-        X_reordered    = X_explain[ordered_names]
+        np.save(shap_npy, shap_matrix)
+        shap_df.to_csv(shap_csv, index=False)
+        X_explain.to_csv(exp_csv, index=False)
 
-        fig, ax = plt.subplots(figsize=(12, max(6, top_n * 0.45)))
-        plt.sca(ax)
-        shap.summary_plot(
-            shap_reordered, X_reordered,
-            feature_names=ordered_names, max_display=top_n,
-            plot_type='dot', show=False)
-        ax = plt.gca()
-        ax.set_title(
-            f'Beeswarm — SHAP values  '
-            f'(n={len(X_explain)}, quartile×label stratified)\n'
-            f'Features ordered by Permutation Importance rank',
-            fontsize=11, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(bee_path, dpi=300, bbox_inches='tight')
-        plt.close()
+    # Bar chart: mean |SHAP|, coloured by direction (mean SHAP sign)
+    _shap_bar_chart(
+        shap_df,
+        title=(f'Global Feature Importance -- Top {top_n}\n'
+               f'(Kernel SHAP, n={len(X_explain):,}, ensemble; '
+               f'red=promotes, blue=suppresses)'),
+        out_path=os.path.join(save_dir, 'shap_bar.png'),
+        top_n=top_n)
+
+    # Beeswarm
+    if os.path.exists(bee_path):
+        print(f"  Beeswarm already exists, skipping")
+    else:
+        _shap_beeswarm(
+            shap_matrix, X_explain, shap_df['feature'].tolist(),
+            title=f'Beeswarm -- SHAP values (n={len(X_explain)}, label-stratified sample)',
+            out_path=bee_path, top_n=top_n)
         print(f"  Beeswarm saved.")
 
-    # Combined summary table
-    shap_importance = pd.DataFrame({
-        'feature':       feature_names,
-        'mean_abs_shap': np.abs(shap_matrix).mean(axis=0),
-    }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
-    summary = pi_df.merge(
-        shap_importance.rename(columns={'mean_abs_shap': 'mean_abs_shap_stratified'}),
-        on='feature', how='left')
-    summary.to_csv(os.path.join(save_dir, 'global_importance_summary.csv'), index=False)
+    print(f"\n  Top 10 features (mean |SHAP|):")
+    for _, row in shap_df.head(10).iterrows():
+        print(f"    {int(row['rank']):2d}. {row['feature']:50s} | {row['mean_abs_shap']:.4f}")
 
-    print(f"\n  Top 10 features (PI rank):")
-    for _, row in pi_df.head(10).iterrows():
-        print(f"    {int(row['rank']):2d}. {row['feature']:50s} | {row['mean_importance']:.4f}")
-
-    return pi_df, shap_matrix, X_explain
+    return shap_df, shap_matrix, X_explain
 
 
 # ===========================================================================
@@ -532,7 +452,7 @@ def _collect_local_indices(y_test, y_pred, y_prob, feature_vals,
     for mask in [tp, fp, tn, fn]:
         chosen.update(pick(mask, n))
 
-    # Samples split by above/below-median feature value × label
+    # Samples split by above/below-median feature value x label
     n2      = cfg['n_per_feat_value']
     medians = feature_vals.median()
     for feat in top_feature_names[:cfg['n_top_features']]:
@@ -574,10 +494,10 @@ def local_shap_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
     if os.path.exists(npy_path) and os.path.exists(idx_path):
         saved_idx = np.load(idx_path).tolist()
         if saved_idx == indices:
-            print(f"  ✅ Local SHAP checkpoint found, loading directly")
+            print(f"  Local SHAP checkpoint found, loading directly")
             shap_matrix = np.load(npy_path)
         else:
-            print(f"  ⚠️  Index mismatch, recomputing")
+            print(f"  Index mismatch, recomputing")
             os.makedirs(ckpt_dir, exist_ok=True)
             bg_idx = np.random.default_rng(0).choice(
                 len(X_test), cfg['n_background'], replace=False)
@@ -646,7 +566,7 @@ def local_shap_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
         plotted[out] = plotted.get(out, 0) + 1
 
     print(f"  Waterfall: {dict(plotted)}")
-    print(f"  ✓ Local SHAP complete")
+    print(f"  Local SHAP complete")
     return explanations
 
 
@@ -671,18 +591,13 @@ def _define_subgroups(y_test, y_pred, y_prob):
 
 
 def subgroup_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
-                      cfg=SUBGROUP_CONFIG, save_dir=None,
-                      global_pi_df=None):
+                      cfg=SUBGROUP_CONFIG, save_dir=None):
     """
-    Run per-subgroup PI, Beeswarm SHAP, and local SHAP with checkpoint resume.
-
-    Parameters
-    ----------
-    global_pi_df : pd.DataFrame, optional
-        Global permutation importance results with a 'feature' column sorted
-        by descending importance. When provided, subgroup PI is restricted to
-        the top cfg['pi_top_n_features'] features, substantially reducing
-        compute time. If None, all features are used (original behaviour).
+    Run per-subgroup Kernel SHAP (ranking + beeswarm) and local SHAP, with
+    checkpoint resume. There is no permutation-importance pass and no
+    global-top-N feature pre-filter: a single joint SHAP call already covers
+    all features regardless of subgroup size, so the earlier PI-only
+    speed-up (restricting to the global top-50 features) is no longer needed.
     """
     print(f"\n{'='*80}")
     print("SUBGROUP ANALYSIS")
@@ -692,24 +607,11 @@ def subgroup_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
         save_dir = os.path.join(OUTPUT_DIR, 'subgroup_analysis')
     os.makedirs(save_dir, exist_ok=True)
 
-    # Determine which features to use for subgroup PI
-    top_n_feat = cfg.get('pi_top_n_features', len(feature_names))
-    if global_pi_df is not None and top_n_feat < len(feature_names):
-        global_top_feats = global_pi_df['feature'].tolist()[:top_n_feat]
-        global_top_feats = [f for f in global_top_feats if f in feature_names]
-        saving_pct = (1 - len(global_top_feats) / len(feature_names)) * 100
-        print(f"\n  ★ Subgroup PI feature filter: global top-{top_n_feat} → "
-              f"{len(global_top_feats)} features  (~{saving_pct:.0f}% time saved)")
-    else:
-        global_top_feats = feature_names
-        print(f"\n  Subgroup PI using all {len(feature_names)} features")
-
     subgroups = _define_subgroups(y_test, y_pred, y_prob)
     print("\n  Subgroup sizes:")
     for name, mask in subgroups.items():
         print(f"    {name:20s}: {mask.sum():6,}  ({mask.mean()*100:5.1f}%)")
 
-    all_pi_rows  = []
     summary_rows = []
 
     for sg_name, mask in subgroups.items():
@@ -728,123 +630,74 @@ def subgroup_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
         yp_sg   = y_pred[mask]
         prob_sg = y_prob[mask]
 
-        has_both = len(np.unique(y_sg)) == 2
-
-        # Features available in this subgroup after applying global top-N filter
-        feats_for_pi = [f for f in global_top_feats if f in X_sg.columns]
-        print(f"    PI feature count: {len(feats_for_pi)}")
-
         # ------------------------------------------------------------------ #
-        # 1. PI — skip if CSV checkpoint exists                               #
+        # 1. Kernel SHAP (ranking + beeswarm) — skip if checkpoint exists     #
         # ------------------------------------------------------------------ #
-        pi_csv = os.path.join(sg_dir, 'pi_importance.csv')
-        if os.path.exists(pi_csv):
-            print(f"  [1/3] ✅ PI checkpoint found, loading: {pi_csv}")
-            pi_sg = pd.read_csv(pi_csv)
-            top_feat_names_sg = pi_sg['feature'].tolist()[:cfg['local_n_top_feats']]
-        elif has_both:
-            print(f"  [1/3] Permutation Importance ({len(feats_for_pi)} features)...")
-            t0 = time.time()
-            pi_sg = compute_permutation_importance(
-                model, X_sg, y_sg, feats_for_pi,   # filtered feature list
-                n_repeats=cfg['pi_n_repeats'],
-                subset_size=min(cfg['pi_subset_size'], n_sg))
-            pi_sg['subgroup'] = sg_name
-            pi_sg.to_csv(pi_csv, index=False)
-            all_pi_rows.append(pi_sg)
-            print(f"    PI done in {(time.time()-t0)/60:.1f} min")
-
-            top_n_sg  = min(cfg['top_n_display'], len(pi_sg))
-            top_pi_sg = pi_sg.head(top_n_sg)
-            fig, ax = plt.subplots(figsize=(10, max(5, top_n_sg * 0.38)))
-            ax.barh(range(top_n_sg), top_pi_sg['mean_importance'],
-                    xerr=top_pi_sg['std_importance'],
-                    color='coral', ecolor='gray', capsize=3, alpha=0.85)
-            ax.set_yticks(range(top_n_sg))
-            ax.set_yticklabels(top_pi_sg['feature'], fontsize=8)
-            ax.invert_yaxis()
-            ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
-            ax.set_xlabel('Mean AUC drop', fontsize=11)
-            ax.set_title(
-                f'{sg_name} — PI\nn={n_sg:,}  '
-                f'(top-{len(feats_for_pi)} features from global PI)',
-                fontsize=12, fontweight='bold')
-            plt.tight_layout()
-            plt.savefig(os.path.join(sg_dir, 'pi_bar.png'), dpi=300, bbox_inches='tight')
-            plt.close()
-            top_feat_names_sg = pi_sg['feature'].tolist()[:cfg['local_n_top_feats']]
-        else:
-            print(f"  [1/3] PI skipped — single-class subgroup")
-            pi_sg = None
-            top_feat_names_sg = feats_for_pi[:cfg['local_n_top_feats']]
-
-        # PI ordering for Beeswarm: use subgroup order when available, else global order
-        pi_order_sg  = pi_sg['feature'].tolist() if pi_sg is not None else feats_for_pi[:]
-        feat_idx_map = {f: i for i, f in enumerate(feature_names)}
-
-        # ------------------------------------------------------------------ #
-        # 2. Beeswarm — resume from batch-level checkpoints                   #
-        # ------------------------------------------------------------------ #
+        shap_csv_sg = os.path.join(sg_dir, 'shap_importance.csv')
+        shap_npy_sg = os.path.join(sg_dir, 'shap_values.npy')
+        exp_csv_sg  = os.path.join(sg_dir, 'shap_explain_sample.csv')
         bee_png     = os.path.join(sg_dir, 'beeswarm.png')
-        bee_npy     = os.path.join(sg_dir, 'beeswarm_shap_values.npy')
         ckpt_dir_sg = os.path.join(sg_dir, 'shap_checkpoints')
 
-        if os.path.exists(bee_png) and os.path.exists(bee_npy):
-            print(f"  [2/3] ✅ Beeswarm already exists, skipping")
-        else:
-            print(f"  [2/3] Beeswarm SHAP...")
-            n_bg_sg   = min(cfg['beeswarm_n_bg'], n_sg // 2, 30)
-            bg_idx_sg = np.random.default_rng(1).choice(n_sg, n_bg_sg, replace=False)
-            X_bg_sg   = X_sg.iloc[bg_idx_sg].reset_index(drop=True)
+        n_explain_sg = min(cfg['n_explain'], n_sg)
+        n_bg_sg      = min(cfg['n_background'], n_sg // 2 if n_sg >= 2 else 1)
 
-            X_exp_sg, _ = _quartile_label_sample(
-                X_sg, y_sg, pi_feature_order=pi_order_sg,
-                feature_names=feature_names,
-                top_k=cfg['beeswarm_top_k'],
-                n_quartiles=cfg['beeswarm_n_quartiles'],
-                n_per_cell=cfg['beeswarm_n_per_cell'], random_state=2)
-            if len(X_exp_sg) > cfg['beeswarm_n']:
-                cap_idx  = np.random.default_rng(3).choice(
-                    len(X_exp_sg), cfg['beeswarm_n'], replace=False)
-                X_exp_sg = X_exp_sg.iloc[cap_idx].reset_index(drop=True)
+        if os.path.exists(shap_npy_sg) and os.path.exists(shap_csv_sg):
+            print(f"  [1/2] Checkpoint found, loading: {shap_csv_sg}")
+            shap_sg    = np.load(shap_npy_sg)
+            shap_df_sg = pd.read_csv(shap_csv_sg)
+            X_exp_sg   = pd.read_csv(exp_csv_sg)[feature_names]
+        else:
+            print(f"  [1/2] Kernel SHAP over all {len(feature_names)} features "
+                  f"(n={n_explain_sg})...")
+            X_exp_sg, _ = _stratified_sample(X_sg, y_sg, n_explain_sg, random_state=2)
+            X_bg_sg, _  = _stratified_sample(X_sg, y_sg, n_bg_sg, random_state=1)
 
             t0 = time.time()
             shap_sg = compute_shap_small_with_checkpoint(
                 model, X_exp_sg, X_bg_sg, feature_names,
-                checkpoint_dir=ckpt_dir_sg, prefix=f'{sg_name}_bee',
-                max_evals=cfg['beeswarm_max_evals'], batch_size=50)
-            np.save(bee_npy, shap_sg)
-            print(f"    Beeswarm done in {(time.time()-t0)/60:.1f} min")
+                checkpoint_dir=ckpt_dir_sg, prefix=f'{sg_name}_shap',
+                max_evals=cfg['max_evals'], batch_size=50)
+            print(f"    SHAP done in {(time.time()-t0)/60:.1f} min")
 
-            top_n_sg         = min(cfg['top_n_display'], len(pi_order_sg))
-            ordered_i        = [feat_idx_map[f] for f in pi_order_sg[:top_n_sg]
-                                 if f in feat_idx_map]
-            ordered_names_sg = [feature_names[i] for i in ordered_i]
-            shap_bee_ord     = shap_sg[:, ordered_i]
-            X_bee_ord        = X_exp_sg[ordered_names_sg]
+            mean_abs = np.abs(shap_sg).mean(axis=0)
+            std_abs  = np.abs(shap_sg).std(axis=0)
+            mean_sg  = shap_sg.mean(axis=0)
+            shap_df_sg = pd.DataFrame({
+                'feature':       feature_names,
+                'mean_abs_shap': mean_abs,
+                'std_abs_shap':  std_abs,
+                'mean_shap':     mean_sg,
+            }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
+            shap_df_sg['subgroup'] = sg_name
 
-            top_bee = min(cfg['top_n_display'], len(ordered_names_sg))
-            fig, ax = plt.subplots(figsize=(12, max(5, top_bee * 0.45)))
-            plt.sca(ax)
-            shap.summary_plot(
-                shap_bee_ord, X_bee_ord,
-                feature_names=ordered_names_sg,
-                max_display=top_bee, plot_type='dot',
-                show=False)
-            ax = plt.gca()
-            ax.set_title(
-                f'{sg_name} — Beeswarm  '
-                f'(n={len(X_exp_sg)}, quartile×label stratified)',
-                fontsize=11, fontweight='bold')
-            plt.tight_layout()
-            plt.savefig(bee_png, dpi=300, bbox_inches='tight')
-            plt.close()
+            np.save(shap_npy_sg, shap_sg)
+            shap_df_sg.to_csv(shap_csv_sg, index=False)
+            X_exp_sg.to_csv(exp_csv_sg, index=False)
+
+            top_n_sg = min(cfg['top_n_display'], len(shap_df_sg))
+            _shap_bar_chart(
+                shap_df_sg,
+                title=f'{sg_name} -- SHAP importance\nn={n_sg:,}',
+                out_path=os.path.join(sg_dir, 'shap_bar.png'),
+                top_n=top_n_sg)
+
+        if not os.path.exists(bee_png):
+            top_n_sg = min(cfg['top_n_display'], len(shap_df_sg))
+            _shap_beeswarm(
+                shap_sg, X_exp_sg, shap_df_sg['feature'].tolist(),
+                title=f'{sg_name} -- Beeswarm (n={len(X_exp_sg)})',
+                out_path=bee_png, top_n=top_n_sg)
             print(f"    Beeswarm saved.")
+        else:
+            print(f"  [1/2] Beeswarm already exists, skipping")
+
+        top_feat_names_sg = shap_df_sg['feature'].tolist()[:cfg['local_n_top_feats']]
 
         # ------------------------------------------------------------------ #
-        # 3. Local SHAP — npy checkpoint                                      #
+        # 2. Local SHAP — npy checkpoint                                      #
         # ------------------------------------------------------------------ #
-        print(f"  [3/3] Local SHAP...")
+        print(f"  [2/2] Local SHAP...")
         local_sg_dir  = os.path.join(sg_dir, 'local_shap')
         os.makedirs(local_sg_dir, exist_ok=True)
 
@@ -871,7 +724,7 @@ def subgroup_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
 
         if (os.path.exists(local_npy) and os.path.exists(local_idx_npy) and
                 np.load(local_idx_npy).tolist() == local_idx_sg):
-            print(f"    ✅ Local SHAP checkpoint found, loading")
+            print(f"    Local SHAP checkpoint found, loading")
             shap_local_sg = np.load(local_npy)
         else:
             bg_idx_l = np.random.default_rng(3).choice(
@@ -932,7 +785,7 @@ def subgroup_analysis(model, X_test, y_test, y_pred, y_prob, feature_names,
         pd.DataFrame(summary_rows).to_csv(
             os.path.join(save_dir, 'subgroup_summary.csv'), index=False)
 
-    print(f"\n  ✓ Subgroup analysis complete")
+    print(f"\n  Subgroup analysis complete")
     return summary_rows
 
 
@@ -947,7 +800,7 @@ def run_tabpfn_pipeline(
     run_subgroup: bool = True,
 ):
     print(f"\n{'='*80}")
-    print("TabPFN Pipeline V4-resume-top50")
+    print("TabPFN Pipeline V5 — Ensemble SHAP-only")
     print(f"{'='*80}")
     t_pipeline = time.time()
 
@@ -961,25 +814,19 @@ def run_tabpfn_pipeline(
     X_train, y_train, X_test, y_test, feature_names = load_and_preprocess(fold)
 
     # Detect checkpoint state for time estimation
-    global_pi_path = os.path.join(OUTPUT_DIR, 'global_importance',
-                                  'pi_feature_importance.csv')
-    global_pi_done   = os.path.exists(global_pi_path)
+    global_shap_path = os.path.join(OUTPUT_DIR, 'global_importance',
+                                    'global_shap_importance.csv')
+    global_shap_done = os.path.exists(global_shap_path)
     ckpt_dir_bee     = os.path.join(OUTPUT_DIR, 'global_importance', 'shap_checkpoints')
     bee_done_batches = 0
     if os.path.exists(ckpt_dir_bee):
-        files = [f for f in os.listdir(ckpt_dir_bee)
-                 if f.startswith('global_bee_batch_')]
+        files = [f for f in os.listdir(ckpt_dir_bee) if f.startswith('global_batch_')]
         bee_done_batches = len(files)
-    bee_samples = (GLOBAL_BEESWARM_CONFIG['top_k_features'] *
-                   GLOBAL_BEESWARM_CONFIG['n_quartiles'] * 2 *
-                   GLOBAL_BEESWARM_CONFIG['n_per_cell'])
-    bee_total = (bee_samples + GLOBAL_BEESWARM_CONFIG['batch_size'] - 1) \
-                // GLOBAL_BEESWARM_CONFIG['batch_size']
+    bee_total = (GLOBAL_SHAP_CONFIG['n_explain'] + GLOBAL_SHAP_CONFIG['batch_size'] - 1) \
+                // GLOBAL_SHAP_CONFIG['batch_size']
 
     estimate_remaining_time(
-        feature_names,
-        n_subgroups=11,
-        global_pi_done=global_pi_done,
+        global_shap_done=global_shap_done,
         global_bee_batches_done=bee_done_batches,
         global_bee_total_batches=bee_total)
 
@@ -994,14 +841,14 @@ def run_tabpfn_pipeline(
         max_samples=TABPFN_MAX_SAMPLES,
         max_features=TABPFN_MAX_FEATURES)
     ensemble.fit(X_train, y_train, feature_names)
-    print(f"  ✓ {(time.time()-t0)/60:.1f} min")
+    print(f"  {(time.time()-t0)/60:.1f} min")
 
     # ---- 3. Predict ----
     print(f"\n{'='*80}")
     print("Step 3: Predictions")
     print(f"{'='*80}")
     if os.path.exists(pred_csv):
-        print(f"  ✅ Predictions already exist, loading")
+        print(f"  Predictions already exist, loading")
         pred_df = pd.read_csv(pred_csv)
         y_prob  = pred_df['prob_1'].values
         y_pred  = pred_df['prediction'].values
@@ -1016,7 +863,7 @@ def run_tabpfn_pipeline(
             'prediction': y_pred,        'true_label': y_test,
         })
         pred_df.to_csv(pred_csv, index=False)
-        print(f"  ✓ {(time.time()-t0):.1f}s")
+        print(f"  {(time.time()-t0):.1f}s")
 
     metrics_path = os.path.join(OUTPUT_DIR, 'predictions',
                                 f'metrics_fold_{fold}.json')
@@ -1030,34 +877,38 @@ def run_tabpfn_pipeline(
 
     print(f"  ROC-AUC={metrics['roc_auc']:.4f}  F1={metrics['macro_f1']:.4f}")
 
-    best_idx   = int(np.argmax(ensemble.oob_scores))
-    best_model = ensemble.models[best_idx]['model']
-    print(f"  Best model: bag {best_idx+1}  OOB={ensemble.oob_scores[best_idx]:.4f}")
+    # All explanations query the full soft-voted ensemble (all bags), not a
+    # single "best" bag, so the explained decision function matches the one
+    # whose performance is reported above / in Table 2.
+    model_for_xai = EnsembleModelAdapter(ensemble, feature_names)
+    print(f"  Explaining the full {len(ensemble.models)}-bag ensemble "
+          f"(bag OOB AUCs: min={min(ensemble.oob_scores):.4f}, "
+          f"max={max(ensemble.oob_scores):.4f})")
 
     xai_results = {}
 
     # ---- 4. Global ----
     if run_global:
         print(f"\n{'='*80}")
-        print("Step 4: Global Feature Analysis")
+        print("Step 4: Global SHAP Analysis")
         print(f"{'='*80}")
         t0 = time.time()
-        pi_df, _, _ = global_feature_analysis(
-            best_model, X_test, y_test, feature_names,
+        shap_df, _, _ = global_shap_analysis(
+            model_for_xai, X_test, y_test, feature_names,
             save_dir=os.path.join(OUTPUT_DIR, 'global_importance'))
-        xai_results['global_pi'] = pi_df
-        print(f"  ✓ {(time.time()-t0)/60:.1f} min")
+        xai_results['global_shap'] = shap_df
+        print(f"  {(time.time()-t0)/60:.1f} min")
     else:
-        # Even when skipping global analysis, load existing PI for subgroup filtering
-        if os.path.exists(global_pi_path):
-            pi_df = pd.read_csv(global_pi_path)
-            print(f"  [Global PI loaded from checkpoint for subgroup filtering]")
+        # Even when skipping global analysis, load existing ranking for local sample selection
+        if os.path.exists(global_shap_path):
+            shap_df = pd.read_csv(global_shap_path)
+            print(f"  [Global SHAP ranking loaded from checkpoint]")
         else:
-            pi_df = pd.DataFrame({'feature':         feature_names,
-                                  'mean_importance': 0,
-                                  'rank':            range(1, len(feature_names)+1)})
+            shap_df = pd.DataFrame({'feature':       feature_names,
+                                    'mean_abs_shap': 0,
+                                    'rank':          range(1, len(feature_names)+1)})
 
-    top_feat_names = pi_df['feature'].tolist()[:LOCAL_SHAP_CONFIG['n_top_features']]
+    top_feat_names = shap_df['feature'].tolist()[:LOCAL_SHAP_CONFIG['n_top_features']]
 
     # ---- 5. Local SHAP ----
     if run_local:
@@ -1066,29 +917,28 @@ def run_tabpfn_pipeline(
         print(f"{'='*80}")
         t0 = time.time()
         local_exp = local_shap_analysis(
-            best_model, X_test, y_test, y_pred, y_prob, feature_names,
+            model_for_xai, X_test, y_test, y_pred, y_prob, feature_names,
             top_feature_names=top_feat_names,
             save_dir=os.path.join(OUTPUT_DIR, 'local_shap'))
         xai_results['local'] = local_exp
-        print(f"  ✓ {(time.time()-t0)/60:.1f} min")
+        print(f"  {(time.time()-t0)/60:.1f} min")
 
-    # ---- 6. Subgroup — pass global_pi_df to enable top-N feature filtering ----
+    # ---- 6. Subgroup ----
     if run_subgroup:
         print(f"\n{'='*80}")
         print("Step 6: Subgroup Analysis")
         print(f"{'='*80}")
         t0 = time.time()
         sg_summary = subgroup_analysis(
-            best_model, X_test, y_test, y_pred, y_prob, feature_names,
-            save_dir=os.path.join(OUTPUT_DIR, 'subgroup_analysis'),
-            global_pi_df=pi_df)           # enables top-N feature filtering
+            model_for_xai, X_test, y_test, y_pred, y_prob, feature_names,
+            save_dir=os.path.join(OUTPUT_DIR, 'subgroup_analysis'))
         xai_results['subgroup'] = sg_summary
-        print(f"  ✓ {(time.time()-t0)/60:.1f} min")
+        print(f"  {(time.time()-t0)/60:.1f} min")
 
     total = time.time() - t_pipeline
     print(f"\n{'='*80}")
     print(f"PIPELINE COMPLETE — {total/3600:.2f} h  ({total/60:.0f} min)")
-    print(f"Results → {OUTPUT_DIR}")
+    print(f"Results -> {OUTPUT_DIR}")
     print(f"{'='*80}")
     return pred_df, metrics, xai_results
 

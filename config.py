@@ -18,8 +18,11 @@ ENSEMBLE_STRATEGY_CONFIGURATION
     Bagging strategy, bag size, class-balancing strategy and target ratio.
 TRAINING_CONFIGURATION
     Prediction batch size and test-set sampling ratio.
-SHAP_ANALYSIS_CONFIGURATION
-    Strategy, sample sizes, and approximation settings for Kernel SHAP.
+
+Kernel SHAP sample sizes and approximation settings for the explainability
+pipeline (global/subgroup/local) live in ``tabpfn_xai.py`` itself
+(``GLOBAL_SHAP_CONFIG``, ``SUBGROUP_CONFIG``, ``LOCAL_SHAP_CONFIG``), since
+that module is the only consumer.
 """
 
 import os
@@ -84,31 +87,6 @@ ENSEMBLE_CONFIG = {
 # ===========================================================================
 PREDICT_BATCH_SIZE = 5000
 TEST_SAMPLE_RATIO = 0.1  # Test set sampling ratio (relative to training set size)
-
-# ===========================================================================
-# SHAP ANALYSIS CONFIGURATION (for xAI)
-# ===========================================================================
-SHAP_CONFIG = {
-    # Strategy selection
-    'strategy': 'representative',  # Options: 'representative', 'ensemble_blackbox', 'aggregated'
-    
-    # Representative model strategy (FASTEST)
-    'n_representative_models': 1,  # Use only 1-2 best models
-    'selection_criterion': 'oob_score',  # 'oob_score', 'random', or index list [0,5,10]
-    
-    # Sampling (CRITICAL for speed)
-    'n_background': 50,        # Background samples (50-100 is enough)
-    'n_explain_global': 1000,  # Global SHAP samples (1000-2000)
-    'n_explain_local': 5,    # Local SHAP samples (100-500)
-    
-    # Approximation (CRITICAL for speed)
-    'max_evals': 120,          # Kernel evaluations (500-1000, vs 2*n_features)
-    'batch_size': 10,         # SHAP batch size
-    
-    # Quality vs Speed tradeoff
-    'use_fast_shap': True,     # Use approximations
-    'cache_shap': True,        # Cache SHAP values
-}
 
 # ===========================================================================
 # ENVIRONMENT CONFIGURATION

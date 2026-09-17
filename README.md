@@ -13,7 +13,7 @@ This repository contains the full code for a study that predicts whether seconda
 3. **Feature extraction** – individual-level static (demographic/socioeconomic) and dynamic (medical-history) features.
 4. **Feature aggregation** – aggregating person-level features to the household level, encoding, and producing stratified k-fold splits.
 5. **Model training** – TabPFN ensemble (primary model) plus Logistic Regression, Random Forest, and XGBoost baselines.
-6. **Explainability analysis** – global permutation importance, Kernel SHAP (subgroup and local waterfall plots).
+6. **Explainability analysis** – Kernel SHAP against the full ensemble at global, subgroup, and local (waterfall) levels.
 
 ---
 
@@ -34,7 +34,8 @@ This repository contains the full code for a study that predicts whether seconda
 │                                      #           FeatureSelector, TabPFNEnsemble)
 ├── tabpfn_train.py                    # Step 5b – TabPFN 5-fold CV training & evaluation
 │                                      #           (equivalent to baseline scripts)
-├── tabpfn_xai.py                      # Step 5c – Explainability analysis (PI + SHAP)
+├── tabpfn_xai.py                      # Step 5c – Explainability analysis (Kernel SHAP,
+│                                      #          full ensemble; global/subgroup/local)
 │
 ├── baseline_logistic_regression.py    # Logistic Regression baseline
 ├── baseline_random_forest.py          # Random Forest baseline
@@ -164,12 +165,14 @@ All three baseline scripts (Logistic Regression, Random Forest, XGBoost) follow 
 
 ## Explainability
 
-`tabpfn_xai.py` implements a three-level interpretability framework:
+`tabpfn_xai.py` implements a three-level interpretability framework, entirely via
+Kernel SHAP computed against the full 8-bag soft-voted ensemble (not a single
+representative bag):
 
 | Level | Method | Purpose |
 |-------|--------|---------|
-| Global | Permutation Importance (AUC-drop, n = 3,000, R = 5) | Which features matter overall? |
-| Subgroup | PI + Kernel SHAP on risk strata | Do importance patterns differ by predicted risk? |
+| Global | Kernel SHAP ranking (mean \|SHAP\|) + beeswarm, n = 1,000, label-stratified | Which features matter overall, and in which direction? |
+| Subgroup | Kernel SHAP ranking + beeswarm on risk strata | Do importance patterns differ by predicted risk? |
 | Local | Kernel SHAP waterfall plots | Why did the model assign this score to this household? |
 
 The risk strata are defined by the ensemble's predicted probability:
@@ -233,7 +236,7 @@ MODEL_PATH = './tabpfn_weights/tabpfn-v2.5-classifier-v2.5_default.ckpt'
 ├── Feature_Tables/                  # Steps 2–3 output: household map + raw feature CSV
 ├── Household_Features/              # Step 4 intermediate: unaggregated household table
 ├── Encoded_Household_Features_Full/ # Step 4 output: k-fold train/val/test CSVs
-├── TabPFN_XAI_Results_Full/         # Steps 5a–5b output: metrics, SHAP plots, PI charts
+├── TabPFN_XAI_Results_Full/         # Steps 5a–5b output: metrics, SHAP plots/importances
 ├── LR_results_balanced_Full_2/      # Logistic Regression results
 ├── RF_results_balanced_Full_2/      # Random Forest results
 └── XGB_results_balanced_Full_2/     # XGBoost results
