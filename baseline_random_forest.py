@@ -8,11 +8,16 @@ Trains a Random Forest (n_estimators=200, max_depth=15) classifier on the strati
 ``feature_aggregation.py`` using ``class_weight='balanced'`` (or
 ``scale_pos_weight`` for XGBoost) to handle the ~4:1 class imbalance.
 
+The decision threshold is grid-searched on the validation set only (maximum
+positive-class F1) rather than the default 0.5 cutoff, so this baseline is
+optimised under the same criterion as the TabPFN ensemble.
+
 Metrics reported per fold and averaged across 5 folds
 ------------------------------------------------------
 - ROC-AUC, Macro F1, Weighted F1, Balanced Accuracy, MCC
-- Class-1 (secondary transmission present): Precision, Recall, F1, AUC
-- Cohen Kappa, Log Loss
+- Class-1 (secondary transmission present): Precision (PPV), Recall,
+  Specificity, F1, AUC
+- Cohen Kappa, Log Loss, selected decision threshold
 
 Outputs written to ``RF_results_Full/``
 -----------------------------------------
@@ -33,7 +38,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (roc_auc_score, average_precision_score, 
                              classification_report, confusion_matrix,
                              log_loss, balanced_accuracy_score, 
-                             cohen_kappa_score, matthews_corrcoef)
+                             cohen_kappa_score, matthews_corrcoef, f1_score)
 import os
 import json
 import joblib
@@ -135,6 +140,26 @@ def apply_imbalance_handling(X_train, y_train, strategy='smote', sampling_ratio=
     return X_resampled, y_resampled
 
 
+def select_threshold(y_true, y_prob, grid=None):
+    """
+    Grid-search the decision threshold that maximises positive-class F1 on
+    the given (validation) set. This gives TabPFN and every baseline the
+    same, precisely-defined, validation-only threshold-selection criterion,
+    rather than the implicit 0.5 cutoff `model.predict()` uses by default.
+
+    Returns (best_threshold, best_val_f1).
+    """
+    if grid is None:
+        grid = np.linspace(0.01, 0.99, 99)
+    best_t, best_f1 = 0.5, -1.0
+    for t in grid:
+        pred = (y_prob >= t).astype(int)
+        f1 = f1_score(y_true, pred, pos_label=1, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return float(best_t), float(best_f1)
+
+
 def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
     report       = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
     auc_macro    = roc_auc_score(y_true, y_prob)
@@ -165,6 +190,11 @@ def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
         result[f'class_{cls}_support']   = int  (report.get(str(cls), {}).get('support',   0))
         result[f'class_{cls}_auc']       = roc_auc_score(y_true == cls, y_prob) if cls == 1 else np.nan
         result[f'class_{cls}_pr_auc']    = average_precision_score(y_true == cls, y_prob) if cls == 1 else np.nan
+
+    # Explicit aliases for reviewer-requested metrics: PPV is class-1
+    # precision, specificity is class-0 recall (true-negative rate).
+    result['ppv']         = result['class_1_precision']
+    result['specificity'] = result['class_0_recall']
 
     return result
 
@@ -209,13 +239,20 @@ for fold in range(1, 6):
     if hasattr(model, 'oob_score_'):
         print(f"  OOB Score: {model.oob_score_:.4f}")
 
-    # ── Evaluate on full sets ──────────────────────────────────────────────
-    val_prob    = model.predict_proba(X_val_imp)[:, 1]
-    val_pred    = model.predict(X_val_imp)
+    # ── Threshold selection on validation set, then evaluate on full sets ──
+    # Selecting the decision threshold on the validation set (never on
+    # test) puts every baseline under the same optimisation objective as
+    # the TabPFN ensemble, rather than comparing baselines at the default
+    # 0.5 cutoff against a TabPFN tuned for positive-class recall.
+    val_prob = model.predict_proba(X_val_imp)[:, 1]
+    best_threshold, best_val_f1 = select_threshold(y_val.values, val_prob)
+    print(f"  Selected threshold (max val F1+): {best_threshold:.2f}  (val F1+={best_val_f1:.4f})")
+
+    val_pred    = (val_prob >= best_threshold).astype(int)
     val_metrics = compute_detailed_metrics(y_val.values, val_pred, val_prob)
 
     test_prob    = model.predict_proba(X_test_imp)[:, 1]
-    test_pred    = model.predict(X_test_imp)
+    test_pred    = (test_prob >= best_threshold).astype(int)
     test_metrics = compute_detailed_metrics(y_test.values, test_pred, test_prob)
 
     # Print results
@@ -231,8 +268,9 @@ for fold in range(1, 6):
     print(f"MCC:              {val_metrics['mcc']:.4f}")
     print(f"\nClass 1 (Has secondary) Metrics:")
     print(f"  AUC:            {val_metrics['class_1_auc']:.4f}")
-    print(f"  Precision:      {val_metrics['class_1_precision']:.4f}")
+    print(f"  Precision (PPV):{val_metrics['ppv']:.4f}")
     print(f"  Recall:         {val_metrics['class_1_recall']:.4f}")
+    print(f"  Specificity:    {val_metrics['specificity']:.4f}")
     print(f"  F1:             {val_metrics['class_1_f1']:.4f}")
 
     print(f"\n{'='*60}")
@@ -247,8 +285,9 @@ for fold in range(1, 6):
     print(f"MCC:              {test_metrics['mcc']:.4f}")
     print(f"\nClass 1 (Has secondary) Metrics:")
     print(f"  AUC:            {test_metrics['class_1_auc']:.4f}")
-    print(f"  Precision:      {test_metrics['class_1_precision']:.4f}")
+    print(f"  Precision (PPV):{test_metrics['ppv']:.4f}")
     print(f"  Recall:         {test_metrics['class_1_recall']:.4f}")
+    print(f"  Specificity:    {test_metrics['specificity']:.4f}")
     print(f"  F1:             {test_metrics['class_1_f1']:.4f}")
 
     # Feature importance
@@ -275,6 +314,7 @@ for fold in range(1, 6):
         'n_val':              len(y_val),
         'n_test':             len(y_test),
         'imbalance_strategy': IMBALANCE_STRATEGY,
+        'threshold':          best_threshold,
         'oob_score':          model.oob_score_ if hasattr(model, 'oob_score_') else None,
         'val':                val_metrics,
         'test':               test_metrics,
@@ -294,6 +334,7 @@ for r in all_fold_results:
         'imbalance_strategy': r['imbalance_strategy'],
         'n_train_original':   r['n_train_original'],
         'n_train_balanced':   r['n_train_balanced'],
+        'threshold':          r['threshold'],
         'oob_score':          r.get('oob_score'),
         # Validation metrics
         'val_roc_auc':    r['val']['roc_auc'],
@@ -311,6 +352,10 @@ for r in all_fold_results:
         'test_balanced_acc': r['test']['balanced_accuracy'],
         'test_kappa':        r['test']['cohen_kappa'],
         'test_mcc':          r['test']['mcc'],
+        'val_ppv':           r['val']['ppv'],
+        'val_specificity':   r['val']['specificity'],
+        'test_ppv':          r['test']['ppv'],
+        'test_specificity':  r['test']['specificity'],
     }
     for cls in range(2):
         row[f'val_class{cls}_auc']        = r['val'].get(f'class_{cls}_auc',       np.nan)
@@ -359,6 +404,10 @@ print(f"  AUC:               {summary_df['val_class1_auc'].mean():.4f} ± {summa
 print(f"  F1:                {summary_df['val_class1_f1'].mean():.4f} ± {summary_df['val_class1_f1'].std():.4f}")
 print(f"  Recall:            {summary_df['val_class1_recall'].mean():.4f} ± {summary_df['val_class1_recall'].std():.4f}")
 print(f"  Precision:         {summary_df['val_class1_precision'].mean():.4f} ± {summary_df['val_class1_precision'].std():.4f}")
+print(f"  Specificity:       {summary_df['val_specificity'].mean():.4f} ± {summary_df['val_specificity'].std():.4f}")
+
+print(f"\nSelected threshold (avg across folds, max val F1+): "
+      f"{summary_df['threshold'].mean():.3f} ± {summary_df['threshold'].std():.3f}")
 
 print(f"\n{'='*60}")
 print("TEST SET — AVERAGED ACROSS 5 FOLDS:")
@@ -375,6 +424,7 @@ print(f"  AUC:               {summary_df['test_class1_auc'].mean():.4f} ± {summ
 print(f"  F1:                {summary_df['test_class1_f1'].mean():.4f} ± {summary_df['test_class1_f1'].std():.4f}")
 print(f"  Recall:            {summary_df['test_class1_recall'].mean():.4f} ± {summary_df['test_class1_recall'].std():.4f}")
 print(f"  Precision:         {summary_df['test_class1_precision'].mean():.4f} ± {summary_df['test_class1_precision'].std():.4f}")
+print(f"  Specificity:       {summary_df['test_specificity'].mean():.4f} ± {summary_df['test_specificity'].std():.4f}")
 
 if 'oob_score' in summary_df.columns and not summary_df['oob_score'].isna().all():
     print(f"\nOOB Score:           {summary_df['oob_score'].mean():.4f} ± {summary_df['oob_score'].std():.4f}")

@@ -66,9 +66,31 @@ class Config:
     ENCODING = 'latin1'
     
     # Time windows for dynamic features (days)
-    INERA_WINDOW = 365  # 1 year before index date
-    LMED_WINDOW = 365   # 1 year before index date
-    
+    INERA_WINDOW = 365  # 1 year before the reference date
+    LMED_WINDOW = 365   # 1 year before the reference date
+    # OV/SV (outpatient/inpatient diagnoses) have no lower bound (all-time
+    # history), but are always upper-bounded at the reference date below --
+    # see count_codes(). Earlier versions applied no date filter at all for
+    # OV/SV, which could count diagnoses recorded after the reference date.
+
+    # Which reference date to anchor dynamic (medical-history) features to:
+    #   'individual' -- each member's own IndexDate (own first diagnosis for
+    #                    infected members, latest household index date for
+    #                    uninfected members). This is what the published
+    #                    results use, but for secondary cases it falls after
+    #                    the household's outbreak began, so any diagnosis,
+    #                    prescription, or contact recorded between the
+    #                    household's first case and that member's own
+    #                    (later) reference date is still included -- a
+    #                    potential target-leakage channel raised in review.
+    #   'household'  -- every member in a household anchored to the single
+    #                    earliest infection date in that household
+    #                    (HouseholdAnchorDate), so no member's features can
+    #                    reflect anything observed after the household's
+    #                    transmission episode started. Use this for the
+    #                    leakage-free sensitivity analysis.
+    ANCHOR_MODE = 'individual'  # 'individual' | 'household'
+
     # Feature extraction flags
     EXTRACT_STATIC = True
     EXTRACT_INERA = True
@@ -222,48 +244,55 @@ def count_codes(
     window_days: Optional[int] = None
 ) -> Dict[str, int]:
     """
-    Count occurrences of codes for a person, optionally within a time window.
-    
+    Count occurrences of codes for a person, up to and including index_date,
+    optionally restricted to a fixed-length window before it.
+
     Args:
         person_id: Person identifier
         code_dict: Dictionary mapping person IDs to lists of code records
         date_field: Name of date field in records
         code_field: Name of code field in records
-        index_date: Index date for time window
-        window_days: Number of days before index_date to count (None = all time)
-        
+        index_date: Reference date; when given, any record dated after this
+            is excluded, so features cannot reflect information observed
+            after the reference date
+        window_days: Additional lower bound: only count records within this
+            many days before index_date (None = no lower bound, i.e. all
+            time up to index_date)
+
     Returns:
         Dictionary mapping codes to counts
     """
     if person_id not in code_dict or not code_dict[person_id]:
         return defaultdict(int)
-    
+
     counts = defaultdict(int)
-    
-    # Parse index date if time window is specified
+
+    # Parse index date if one was given
     index_date_parsed = parse_date(index_date) if index_date else None
     start_date = (index_date_parsed - timedelta(days=window_days)) if (window_days and index_date_parsed) else None
-    
+
     # Count codes
     for entry in code_dict[person_id]:
         entry_date_str = entry.get(date_field)
         if not entry_date_str:
             continue
-        
+
         entry_date = parse_date(entry_date_str)
         if pd.isna(entry_date):
             continue
-        
+
         code = entry.get(code_field)
         if code is None:
             continue
-        
-        # Apply time window filter if specified
-        if window_days is not None and start_date is not None:
-            if start_date <= entry_date <= index_date_parsed:
-                counts[code] += 1
-        else:
-            counts[code] += 1
+
+        # Upper bound: never count anything after the reference date.
+        if index_date_parsed is not None and entry_date > index_date_parsed:
+            continue
+        # Optional lower bound: restrict to a fixed window before it.
+        if start_date is not None and entry_date < start_date:
+            continue
+
+        counts[code] += 1
     
     return counts
 
@@ -295,9 +324,11 @@ def count_trygg(person_id: str, sol_dict: Dict) -> Tuple[int, int]:
 def load_main_index() -> pd.DataFrame:
     """
     Load and prepare the main population index.
-    
+
     Returns:
-        Prepared DataFrame with person_id and IndexDate
+        Prepared DataFrame with person_id, IndexDate (each member's own
+        reference date), and HouseholdAnchorDate (the household's earliest
+        infection date, identical for every member -- see Config.ANCHOR_MODE).
     """
     print(f"\n{'='*80}")
     print("LOADING POPULATION INDEX")
@@ -312,9 +343,10 @@ def load_main_index() -> pd.DataFrame:
     df = df.reset_index()
     df.rename(columns={
         'P1105_LopNr_PersonNr': 'person_id',
-        'index_date': 'IndexDate'
+        'index_date': 'IndexDate',
+        'household_anchor_date': 'HouseholdAnchorDate',
     }, inplace=True)
-    
+
     # Normalize person_id (remove trailing .0)
     df['person_id'] = df['person_id'].astype(str).str.rstrip('.0')
     
@@ -470,7 +502,9 @@ def extract_dynamic_features_chunk(
     
     Args:
         chunk_df: DataFrame chunk with person_id
-        person_to_date: Mapping of person_id to index_date
+        person_to_date: Mapping of person_id to the reference date used to
+            cut off dynamic features (IndexDate or HouseholdAnchorDate,
+            depending on Config.ANCHOR_MODE)
         feature_dicts: Dictionary of feature dictionaries
         unique_codes: Dictionary of unique code sets
         
@@ -510,20 +544,22 @@ def extract_dynamic_features_chunk(
             for code in unique_codes.get('atc_codes', []):
                 row[f'lmed_{code}'] = lmed_counts.get(code, 0)
         
-        # OV features (outpatient diagnoses)
+        # OV features (outpatient diagnoses, all-time but never after index_date)
         if Config.EXTRACT_OV and 'ov' in feature_dicts:
             ov_counts = count_codes(
                 person, feature_dicts['ov'],
-                'CodeDate', 'Code'
+                'CodeDate', 'Code',
+                index_date
             )
             for code in unique_codes.get('ov_codes', []):
                 row[f'ov_{code}'] = ov_counts.get(code, 0)
-        
-        # SV features (inpatient diagnoses)
+
+        # SV features (inpatient diagnoses, all-time but never after index_date)
         if Config.EXTRACT_SV and 'sv' in feature_dicts:
             sv_counts = count_codes(
                 person, feature_dicts['sv'],
-                'CodeDate', 'Code'
+                'CodeDate', 'Code',
+                index_date
             )
             for code in unique_codes.get('sv_codes', []):
                 row[f'sv_{code}'] = sv_counts.get(code, 0)
@@ -578,9 +614,24 @@ def extract_dynamic_features(df: pd.DataFrame, unique_codes: Dict[str, set]) -> 
     
     print_memory_usage("After loading dictionaries")
     
-    # Create person_id to date mapping
-    print("Creating person-to-date mapping...")
-    person_to_date = dict(zip(df['person_id'], df['IndexDate']))
+    # Create person_id to date mapping. ANCHOR_MODE='household' anchors every
+    # household member's dynamic features to the household's single earliest
+    # infection date (leakage-free sensitivity analysis); the default
+    # 'individual' mode reproduces the originally published behaviour.
+    print(f"Creating person-to-date mapping (ANCHOR_MODE='{Config.ANCHOR_MODE}')...")
+    if Config.ANCHOR_MODE == 'household':
+        if 'HouseholdAnchorDate' not in df.columns:
+            raise ValueError(
+                "Config.ANCHOR_MODE='household' requires a 'HouseholdAnchorDate' "
+                "column, which is only present in indices produced by the "
+                "updated data_preprocessing.py. Re-run data_preprocessing.py "
+                "or use Config.ANCHOR_MODE='individual'.")
+        person_to_date = dict(zip(df['person_id'], df['HouseholdAnchorDate']))
+    elif Config.ANCHOR_MODE == 'individual':
+        person_to_date = dict(zip(df['person_id'], df['IndexDate']))
+    else:
+        raise ValueError(f"Unknown Config.ANCHOR_MODE: {Config.ANCHOR_MODE!r} "
+                         f"(expected 'individual' or 'household')")
     
     # Setup output
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
