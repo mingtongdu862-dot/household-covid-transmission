@@ -12,7 +12,7 @@ This repository contains the full code for a study that predicts whether seconda
 2. **Household mapping** – building a wide-format household-to-member table.
 3. **Feature extraction** – individual-level static (demographic/socioeconomic) and dynamic (medical-history) features.
 4. **Feature aggregation** – aggregating person-level features to the household level, encoding, and producing stratified k-fold splits.
-5. **Model training** – TabPFN ensemble (primary model) plus Logistic Regression, Random Forest, and XGBoost baselines.
+5. **Model training** – TabPFN ensemble (primary model) plus Logistic Regression, Random Forest, XGBoost, LightGBM, and CatBoost baselines.
 6. **Explainability analysis** – Kernel SHAP against the full ensemble at global, subgroup, and local (waterfall) levels.
 
 ---
@@ -39,7 +39,9 @@ This repository contains the full code for a study that predicts whether seconda
 │
 ├── baseline_logistic_regression.py    # Logistic Regression baseline
 ├── baseline_random_forest.py          # Random Forest baseline
-└── baseline_xgboost.py               # XGBoost baseline
+├── baseline_xgboost.py                # XGBoost baseline
+├── baseline_lightgbm.py               # LightGBM baseline
+└── baseline_catboost.py               # CatBoost baseline
 ```
 
 ---
@@ -73,6 +75,8 @@ python tabpfn_xai.py
 python baseline_logistic_regression.py
 python baseline_random_forest.py
 python baseline_xgboost.py
+python baseline_lightgbm.py
+python baseline_catboost.py
 ```
 
 ---
@@ -110,7 +114,8 @@ class Config:
 
 ## Configuration
 
-All key settings are centralised in `config.py`. The most important parameters are:
+Training/ensemble settings are centralised in `config.py`. The most important
+parameters are:
 
 ```python
 # Input / output
@@ -129,16 +134,35 @@ ENSEMBLE_CONFIG = {
     'target_ratio'    : 0.6,     # 60 % positive per bag (oversampling)
     ...
 }
-
-# SHAP analysis
-SHAP_CONFIG = {
-    'n_background'      : 50,
-    'n_explain_global'  : 1_000,
-    'max_evals'         : 120,
-    ...
-}
 ```
 
+Kernel SHAP sample sizes / approximation settings (`GLOBAL_SHAP_CONFIG`,
+`SUBGROUP_CONFIG`, `LOCAL_SHAP_CONFIG`) live in `tabpfn_xai.py` itself, since
+it is the only consumer.
+
+### Leakage-free feature anchoring (`feature_extraction.py`)
+
+By default, each household member's dynamic (medical-history) features are
+built using their own reference date (`Config.ANCHOR_MODE = 'individual'`):
+each infected member's own first-diagnosis date, or the household's latest
+index date for uninfected members. For secondary cases this reference date
+falls *after* the household's outbreak began, so features can in principle
+reflect information observed between the household's first case and that
+member's own (later) diagnosis.
+
+Setting `Config.ANCHOR_MODE = 'household'` instead anchors every member in a
+household to the single earliest infection date in that household
+(`HouseholdAnchorDate`, produced by `data_preprocessing.py`), so no member's
+features can reflect anything observed after the household's transmission
+episode started. Use this mode to reproduce the leakage-free sensitivity
+analysis; re-run `data_preprocessing.py` first if your existing index
+pickles predate this option (they won't have the `HouseholdAnchorDate`
+column).
+
+Independently of `ANCHOR_MODE`, outpatient/inpatient diagnosis counts (OV/SV)
+are now always truncated at the reference date (no diagnosis recorded after
+it is ever counted) — earlier versions applied no date filter to these two
+feature groups at all.
 
 ---
 
@@ -156,10 +180,12 @@ Inference uses soft-voting (arithmetic mean of predicted probabilities) across a
 
 ### Baselines
 
-All three baseline scripts (Logistic Regression, Random Forest, XGBoost) follow the same evaluation protocol:
+All five baseline scripts (Logistic Regression, Random Forest, XGBoost,
+LightGBM, CatBoost) follow the same evaluation protocol:
 
-1. Train on full imbalanced training folds with `class_weight='balanced'` (or `scale_pos_weight` for XGBoost).
-2. Evaluate on a balanced held-out subset (n = 4,000, 50 % positive) to ensure fair comparison with TabPFN.
+1. Train on full imbalanced training folds with `class_weight='balanced'` (or `scale_pos_weight` for the gradient-boosting baselines).
+2. Select the decision threshold on the validation fold only (the one maximising positive-class F1), then evaluate that fixed threshold on the full natural-distribution validation and test sets. This mirrors the TabPFN ensemble's optimisation objective (tuned for positive-class recall) with the same validation-only threshold-selection discipline, rather than comparing every baseline at the implicit 0.5 cutoff.
+3. Report ROC-AUC, MCC, PPV, specificity, and positive-class recall/F1/AUC/PR-AUC, alongside a confusion matrix, for both folds.
 
 ---
 
@@ -203,6 +229,8 @@ tabpfn >= 2.5          # TabPFN v2.5 with large-samples checkpoint
 torch                  # PyTorch (GPU recommended)
 scikit-learn
 xgboost
+lightgbm
+catboost
 imbalanced-learn
 shap
 pandas
@@ -214,7 +242,7 @@ psutil
 Install dependencies:
 
 ```bash
-pip install tabpfn torch scikit-learn xgboost imbalanced-learn shap pandas numpy tqdm psutil
+pip install tabpfn torch scikit-learn xgboost lightgbm catboost imbalanced-learn shap pandas numpy tqdm psutil
 ```
 
 The TabPFN v2.5 `large-samples` checkpoint can be specified via the `MODEL_PATH` variable in `config.py`:

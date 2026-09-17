@@ -932,7 +932,16 @@ def generate_household_based_index(
     - Label 0 (Other): Healthy household members or infections after incubation_days
     
     Only considers the first transmission cluster in each household.
-    
+
+    In addition to each member's own `index_date` (first confirmed diagnosis,
+    or the first-cluster max date for uninfected members -- both of which can
+    fall after the household's outbreak began), every row also carries
+    `household_anchor_date`: the single earliest infection date in the
+    household, identical for every member. `feature_extraction.py` can use
+    this as a leakage-free reference date so that no member's dynamic
+    (medical-history) features are built from information observed after the
+    household's transmission episode started (see Config.ANCHOR_MODE there).
+
     Args:
         infected_df: Infected population with IndexDate column
         healthy_df: Healthy population (index only)
@@ -1061,31 +1070,31 @@ def generate_household_based_index(
             # Add secondaries (label=2)
             for m, d in secondaries:
                 if m not in added_persons:
-                    new_rows.append([m, d, 2])
+                    new_rows.append([m, d, 2, first_date])
                     added_persons.add(m)
-            
+
             # Add co-primaries (label=1)
             for m, d in co_primaries:
                 if m not in added_persons:
-                    new_rows.append([m, d, 1])
+                    new_rows.append([m, d, 1, first_date])
                     added_persons.add(m)
-            
+
             # Calculate max date for first cluster
             first_cluster_max = max(d for _, d in first_cluster)
-            
+
             # Add subsequent infected as label=0
             for m, d in subsequent_infected:
                 if m not in added_persons:
-                    new_rows.append([m, d, 0])
+                    new_rows.append([m, d, 0, first_date])
                     added_persons.add(m)
-            
+
             # Add healthy household members (label=0, first cluster max date)
             household_healthy = [
-                m for m in members 
+                m for m in members
                 if m in healthy_set and m not in added_persons
             ]
             for h in household_healthy:
-                new_rows.append([h, first_cluster_max, 0])
+                new_rows.append([h, first_cluster_max, 0, first_date])
                 added_persons.add(h)
                 healthy_set.discard(h)
         
@@ -1102,7 +1111,7 @@ def generate_household_based_index(
     print('\nCreating final dataframe...')
     new_df = pd.DataFrame(
         new_rows,
-        columns=['P1105_LopNr_PersonNr', 'index_date', 'label']
+        columns=['P1105_LopNr_PersonNr', 'index_date', 'label', 'household_anchor_date']
     )
     new_df.set_index('P1105_LopNr_PersonNr', inplace=True)
     

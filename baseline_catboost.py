@@ -1,12 +1,15 @@
 """
-baseline_logistic_regression.py
-===============================
-Baseline Logistic Regression classifier for household COVID-19
+baseline_catboost.py
+=====================
+Baseline CatBoost classifier for household COVID-19
 secondary transmission risk prediction.
 
-Trains a Logistic Regression (L2 penalty, lbfgs solver) classifier on the stratified k-fold datasets produced by
-``feature_aggregation.py`` using ``class_weight='balanced'`` (or
-``scale_pos_weight`` for XGBoost) to handle the ~4:1 class imbalance.
+Added for comparability with the XGBoost baseline and the TabPFN ensemble
+(review requested a second strong gradient-boosting baseline). Trains a
+CatBoost (iterations=200, depth=8) classifier on the same stratified
+k-fold datasets produced by ``feature_aggregation.py``, using
+``scale_pos_weight`` to handle the ~4:1 class imbalance -- the same
+imbalance-handling and threshold-selection protocol as ``baseline_xgboost.py``.
 
 The decision threshold is grid-searched on the validation set only (maximum
 positive-class F1) rather than the default 0.5 cutoff, so this baseline is
@@ -19,26 +22,26 @@ Metrics reported per fold and averaged across 5 folds
   Specificity, F1, AUC
 - Cohen Kappa, Log Loss, selected decision threshold
 
-Outputs written to ``LR_results_Full/``
+Outputs written to ``CatBoost_results_Full/``
 -----------------------------------------
-- ``LR_results_Full/household_lr_summary.csv``       per-fold metric summary
-- ``LR_results_Full/household_lr_top50_features.csv`` mean feature importances
-- ``LR_results_Full/household_lr_full_results.json``  complete result dump
-- ``LR_results_Full/lr_model_fold_{k}.joblib``       serialised model (k=1..5)
+- ``CatBoost_results_Full/household_catboost_summary.csv``       per-fold metric summary
+- ``CatBoost_results_Full/household_catboost_top50_features.csv`` mean feature importances
+- ``CatBoost_results_Full/household_catboost_full_results.json``  complete result dump
+- ``CatBoost_results_Full/catboost_model_fold_{k}.joblib``       serialised model (k=1..5)
 
 Usage
 -----
-    python baseline_logistic_regression.py
+    python baseline_catboost.py
 """
 
 import pandas as pd
 import numpy as np
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (roc_auc_score, average_precision_score, 
+from sklearn.metrics import (roc_auc_score, average_precision_score,
                              classification_report, confusion_matrix,
-                             log_loss, balanced_accuracy_score, 
+                             log_loss, balanced_accuracy_score,
                              cohen_kappa_score, matthews_corrcoef, f1_score)
+from catboost import CatBoostClassifier
 import os
 import json
 import joblib
@@ -46,7 +49,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==================== CONFIGURATION ====================
-output_dir = 'LR_results_Full/'
+output_dir = 'CatBoost_results_Full/'
 os.makedirs(output_dir, exist_ok=True)
 
 deleted_cols = []
@@ -59,14 +62,18 @@ IMBALANCE_STRATEGY = 'class_weight'
 # Target balance ratio for sampling methods (None = auto balance)
 SAMPLING_RATIO = 0.8
 
-lr_params = {
-    'max_iter': 1000,
+cat_params = {
+    'iterations': 200,
+    'depth': 8,
+    'learning_rate': 0.05,
+    'subsample': 0.8,
+    'colsample_bylevel': 0.8,
     'random_state': 42,
-    'n_jobs': -1,
-    'solver': 'lbfgs',
-    'class_weight': None,  # Will be set to 'balanced' if using class_weight strategy
-    'penalty': 'l2',
-    'C': 1.0
+    'thread_count': -1,
+    'loss_function': 'Logloss',
+    'scale_pos_weight': None,  # Will be set dynamically if using class_weight
+    'verbose': False,
+    'bootstrap_type': 'Bernoulli',  # required for subsample with CatBoost
 }
 
 # ==================== HELPER FUNCTIONS ====================
@@ -93,29 +100,25 @@ def load_and_preprocess(fold: int):
     y_test  = test_df[label_col]
     X_test  = test_df.drop(label_col, axis=1)
 
+    pos_weight    = (y_train == 0).sum() / (y_train == 1).sum() if (y_train == 1).sum() > 0 else 1.0
     feature_names = X_train.columns.tolist()
-
-    return X_train, y_train, X_val, y_val, X_test, y_test, feature_names
+    return X_train, y_train, X_val, y_val, X_test, y_test, pos_weight, feature_names
 
 
 
 def apply_imbalance_handling(X_train, y_train, strategy='smote', sampling_ratio=None):
     """Apply various imbalance handling strategies"""
     print(f"  Original class distribution: {dict(zip(*np.unique(y_train, return_counts=True)))}")
-    
+
     if strategy == 'none':
         print("  → No resampling applied")
         return X_train, y_train
-    
     elif strategy == 'class_weight':
         print("  → Using class_weight in model (no resampling)")
         return X_train, y_train
-    
-    if sampling_ratio is None:
-        sampling_strategy = 'auto'
-    else:
-        sampling_strategy = sampling_ratio
-    
+
+    sampling_strategy = 'auto' if sampling_ratio is None else sampling_ratio
+
     if strategy == 'smote':
         sampler = SMOTE(sampling_strategy=sampling_strategy, random_state=42)
         print(f"  → Applying SMOTE (ratio={sampling_strategy})")
@@ -136,7 +139,7 @@ def apply_imbalance_handling(X_train, y_train, strategy='smote', sampling_ratio=
         print(f"  → Applying SMOTE + ENN (ratio={sampling_strategy})")
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
-    
+
     X_resampled, y_resampled = sampler.fit_resample(X_train, y_train)
     print(f"  Resampled class distribution: {dict(zip(*np.unique(y_resampled, return_counts=True)))}")
     return X_resampled, y_resampled
@@ -163,8 +166,7 @@ def select_threshold(y_true, y_prob, grid=None):
 
 
 def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
-    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
-    
+    report       = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
     auc_macro    = roc_auc_score(y_true, y_prob)
     pr_auc_macro = average_precision_score(y_true, y_prob)
     cm           = confusion_matrix(y_true, y_pred)
@@ -174,15 +176,15 @@ def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
     mcc          = matthews_corrcoef(y_true, y_pred)
 
     result = {
-        'roc_auc':          float(auc_macro),
-        'macro_pr_auc':       float(pr_auc_macro),
-        'macro_f1':           float(report['macro avg']['f1-score']),
-        'weighted_f1':        float(report['weighted avg']['f1-score']),
-        'log_loss':           float(logloss),
-        'balanced_accuracy':  float(balanced_acc),
-        'cohen_kappa':        float(kappa),
-        'mcc':                float(mcc),
-        'confusion_matrix':   cm.tolist(),
+        'roc_auc':             float(auc_macro),
+        'macro_pr_auc':          float(pr_auc_macro),
+        'macro_f1':              float(report['macro avg']['f1-score']),
+        'weighted_f1':           float(report['weighted avg']['f1-score']),
+        'log_loss':              float(logloss),
+        'balanced_accuracy':     float(balanced_acc),
+        'cohen_kappa':           float(kappa),
+        'mcc':                   float(mcc),
+        'confusion_matrix':      cm.tolist(),
         'classification_report': report,
     }
 
@@ -203,42 +205,42 @@ def compute_detailed_metrics(y_true, y_pred, y_prob, num_classes=2):
 
 # ==================== MAIN TRAINING LOOP ====================
 print("\n" + "="*80)
-print(f"Logistic Regression Training with Imbalance Handling: {IMBALANCE_STRATEGY.upper()}")
+print(f"XGBoost Training with Imbalance Handling: {IMBALANCE_STRATEGY.upper()}")
 print("Evaluation: full (natural distribution) val and test sets")
 print("="*80)
 
-all_fold_results      = []
+all_fold_results       = []
 feature_importance_list = []
 
 for fold in range(1, 6):
     print(f"\n{'='*60}\nFOLD {fold}\n{'='*60}")
-    
-    X_train, y_train, X_val, y_val, X_test, y_test, feature_names = load_and_preprocess(fold)
-    
+
+    X_train, y_train, X_val, y_val, X_test, y_test, pos_weight, feature_names = load_and_preprocess(fold)
+
     # Impute missing values BEFORE resampling
-    imputer      = SimpleImputer(strategy='mean')
-    X_train_imp  = imputer.fit_transform(X_train)
-    X_val_imp    = imputer.transform(X_val)
-    X_test_imp   = imputer.transform(X_test)
-    
+    imputer     = SimpleImputer(strategy='mean')
+    X_train_imp = imputer.fit_transform(X_train)
+    X_val_imp   = imputer.transform(X_val)
+    X_test_imp  = imputer.transform(X_test)
+
     # Apply training imbalance handling
     X_train_balanced, y_train_balanced = apply_imbalance_handling(
         X_train_imp, y_train,
         strategy=IMBALANCE_STRATEGY,
-        sampling_ratio=SAMPLING_RATIO if IMBALANCE_STRATEGY not in ['none', 'class_weight'] else None
+        sampling_ratio=SAMPLING_RATIO if IMBALANCE_STRATEGY not in ['none', 'class_weight'] else None,
     )
-    
+
     # Set model parameters
-    current_params = lr_params.copy()
+    current_params = cat_params.copy()
     if IMBALANCE_STRATEGY == 'class_weight':
-        current_params['class_weight'] = 'balanced'
-        print(f"  → Set class_weight = 'balanced'")
-    
+        current_params['scale_pos_weight'] = pos_weight
+        print(f"  → Set scale_pos_weight = {pos_weight:.2f}")
+
     # Train model
-    print(f"Training Logistic Regression...")
-    model = LogisticRegression(**current_params)
+    print(f"Training CatBoost...")
+    model = CatBoostClassifier(**current_params)
     model.fit(X_train_balanced, y_train_balanced)
-    
+
     # ── Threshold selection on validation set, then evaluate on full sets ──
     # Selecting the decision threshold on the validation set (never on
     # test) puts every baseline under the same optimisation objective as
@@ -248,13 +250,13 @@ for fold in range(1, 6):
     best_threshold, best_val_f1 = select_threshold(y_val.values, val_prob)
     print(f"  Selected threshold (max val F1+): {best_threshold:.2f}  (val F1+={best_val_f1:.4f})")
 
-    val_pred  = (val_prob >= best_threshold).astype(int)
+    val_pred    = (val_prob >= best_threshold).astype(int)
     val_metrics = compute_detailed_metrics(y_val.values, val_pred, val_prob)
-    
-    test_prob  = model.predict_proba(X_test_imp)[:, 1]
-    test_pred  = (test_prob >= best_threshold).astype(int)
+
+    test_prob    = model.predict_proba(X_test_imp)[:, 1]
+    test_pred    = (test_prob >= best_threshold).astype(int)
     test_metrics = compute_detailed_metrics(y_test.values, test_pred, test_prob)
-    
+
     # Print results
     print(f"\n{'='*60}")
     print(f"FOLD {fold} - VALIDATION SET RESULTS (full set):")
@@ -272,7 +274,7 @@ for fold in range(1, 6):
     print(f"  Recall:         {val_metrics['class_1_recall']:.4f}")
     print(f"  Specificity:    {val_metrics['specificity']:.4f}")
     print(f"  F1:             {val_metrics['class_1_f1']:.4f}")
-    
+
     print(f"\n{'='*60}")
     print(f"FOLD {fold} - TEST SET RESULTS (full set):")
     print(f"{'='*60}")
@@ -289,24 +291,23 @@ for fold in range(1, 6):
     print(f"  Recall:         {test_metrics['class_1_recall']:.4f}")
     print(f"  Specificity:    {test_metrics['specificity']:.4f}")
     print(f"  F1:             {test_metrics['class_1_f1']:.4f}")
-    
-    # Feature importance (coefficients)
-    coefficients   = np.abs(model.coef_[0])
+
+    # Feature importance
+    importances    = model.feature_importances_
     fold_importance = pd.DataFrame({
         'feature':    feature_names,
-        'importance': coefficients,
+        'importance': importances,
         'fold':       fold,
     })
     feature_importance_list.append(fold_importance)
-    
+
     # Save model and feature names
-    model_path    = os.path.join(output_dir, f'lr_model_fold_{fold}.joblib')
+    model_path    = os.path.join(output_dir, f'catboost_model_fold_{fold}.joblib')
     joblib.dump(model, model_path)
-    features_path = os.path.join(output_dir, f'lr_features_fold_{fold}.json')
+    features_path = os.path.join(output_dir, f'catboost_features_fold_{fold}.json')
     with open(features_path, 'w') as f:
         json.dump(feature_names, f)
-    
-    # Store results
+
     fold_result = {
         'fold':               fold,
         'n_features':         X_train.shape[1],
@@ -324,8 +325,8 @@ for fold in range(1, 6):
 # ==================== SAVE RESULTS ====================
 importance_df   = pd.concat(feature_importance_list)
 mean_importance = importance_df.groupby('feature')['importance'].mean().sort_values(ascending=False).reset_index()
-top_n           = 50
-top_importance  = mean_importance.head(top_n)
+top_n          = 50
+top_importance = mean_importance.head(top_n)
 
 summary_rows = []
 for r in all_fold_results:
@@ -357,24 +358,24 @@ for r in all_fold_results:
         'test_specificity':  r['test']['specificity'],
     }
     for cls in range(2):
-        row[f'val_class{cls}_auc']       = r['val'].get(f'class_{cls}_auc',       np.nan)
-        row[f'val_class{cls}_f1']        = r['val'].get(f'class_{cls}_f1',        np.nan)
-        row[f'val_class{cls}_recall']    = r['val'].get(f'class_{cls}_recall',    np.nan)
-        row[f'val_class{cls}_precision'] = r['val'].get(f'class_{cls}_precision', np.nan)
-        row[f'test_class{cls}_auc']      = r['test'].get(f'class_{cls}_auc',      np.nan)
-        row[f'test_class{cls}_f1']       = r['test'].get(f'class_{cls}_f1',       np.nan)
-        row[f'test_class{cls}_recall']   = r['test'].get(f'class_{cls}_recall',   np.nan)
-        row[f'test_class{cls}_precision']= r['test'].get(f'class_{cls}_precision',np.nan)
+        row[f'val_class{cls}_auc']        = r['val'].get(f'class_{cls}_auc',       np.nan)
+        row[f'val_class{cls}_f1']         = r['val'].get(f'class_{cls}_f1',        np.nan)
+        row[f'val_class{cls}_recall']     = r['val'].get(f'class_{cls}_recall',    np.nan)
+        row[f'val_class{cls}_precision']  = r['val'].get(f'class_{cls}_precision', np.nan)
+        row[f'test_class{cls}_auc']       = r['test'].get(f'class_{cls}_auc',      np.nan)
+        row[f'test_class{cls}_f1']        = r['test'].get(f'class_{cls}_f1',       np.nan)
+        row[f'test_class{cls}_recall']    = r['test'].get(f'class_{cls}_recall',   np.nan)
+        row[f'test_class{cls}_precision'] = r['test'].get(f'class_{cls}_precision',np.nan)
     summary_rows.append(row)
 
 summary_df   = pd.DataFrame(summary_rows)
-summary_path = os.path.join(output_dir, 'household_lr_summary.csv')
+summary_path = os.path.join(output_dir, 'household_catboost_summary.csv')
 summary_df.to_csv(summary_path, index=False)
 
-importance_path = os.path.join(output_dir, f'household_lr_top{top_n}_features.csv')
+importance_path = os.path.join(output_dir, f'household_catboost_top{top_n}_features.csv')
 top_importance.to_csv(importance_path, index=False)
 
-full_json_path = os.path.join(output_dir, 'household_lr_full_results.json')
+full_json_path = os.path.join(output_dir, 'household_catboost_full_results.json')
 with open(full_json_path, 'w') as f:
     json.dump({
         'imbalance_strategy': IMBALANCE_STRATEGY,
@@ -384,7 +385,7 @@ with open(full_json_path, 'w') as f:
 
 # ==================== PRINT SUMMARY ====================
 print("\n" + "="*80)
-print(f"Logistic Regression (IMBALANCE: {IMBALANCE_STRATEGY.upper()}) — 5-FOLD CV RESULTS")
+print(f"CatBoost (IMBALANCE: {IMBALANCE_STRATEGY.upper()}) — 5-FOLD CV RESULTS")
 print("(Evaluated on full natural-distribution sets)")
 print("="*80)
 
