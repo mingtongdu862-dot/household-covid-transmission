@@ -13,7 +13,7 @@ This repository contains the full code for a study that predicts whether seconda
 3. **Feature extraction** – individual-level static (demographic/socioeconomic) and dynamic (medical-history) features.
 4. **Feature aggregation** – aggregating person-level features to the household level, encoding, and producing stratified k-fold splits.
 5. **Model training** – TabPFN ensemble (primary model) plus Logistic Regression, Random Forest, XGBoost, LightGBM, and CatBoost baselines.
-6. **Explainability analysis** – Kernel SHAP against the full ensemble at global, subgroup, and local (waterfall) levels.
+6. **Explainability analysis** – Kernel SHAP against the full ensemble at global and local (waterfall) levels.
 
 ---
 
@@ -35,7 +35,7 @@ This repository contains the full code for a study that predicts whether seconda
 ├── tabpfn_train.py                    # Step 5b – TabPFN 5-fold CV training & evaluation
 │                                      #           (equivalent to baseline scripts)
 ├── tabpfn_xai.py                      # Step 5c – Explainability analysis (Kernel SHAP,
-│                                      #          full ensemble; global/subgroup/local)
+│                                      #          full ensemble; global/local)
 │
 ├── baseline_logistic_regression.py    # Logistic Regression baseline
 ├── baseline_random_forest.py          # Random Forest baseline
@@ -191,15 +191,23 @@ LightGBM, CatBoost) follow the same evaluation protocol:
 
 ## Explainability
 
-`tabpfn_xai.py` implements a three-level interpretability framework, entirely via
+`tabpfn_xai.py` implements a two-level interpretability framework, entirely via
 Kernel SHAP computed against the full 8-bag soft-voted ensemble (not a single
 representative bag):
 
 | Level | Method | Purpose |
 |-------|--------|---------|
 | Global | Kernel SHAP ranking (mean \|SHAP\|) + beeswarm, n = 1,000, label-stratified | Which features matter overall, and in which direction? |
-| Subgroup | Kernel SHAP ranking + beeswarm on risk strata | Do importance patterns differ by predicted risk? |
-| Local | Kernel SHAP waterfall plots | Why did the model assign this score to this household? |
+| Local | Kernel SHAP waterfall plots (TP/FP/TN/FN + high/low top-feature values, drawn from the whole test set) | Why did the model assign this score to this household? |
+
+A previous version also ran a per-subgroup analysis (risk strata plus
+several model-output-defined groups such as predicted-positive/negative and
+confusion-matrix cells). It was removed: most of those subgroups were never
+referenced in the manuscript, all of them are defined from the model's own
+output (the circularity reviewers flagged), and re-running the full SHAP
+pipeline once per subgroup was the single largest remaining compute cost.
+Local SHAP examples are now drawn from the whole test set rather than from
+risk strata.
 
 The risk strata are defined by the ensemble's predicted probability:
 - **High risk:** ŷ ≥ 0.7
