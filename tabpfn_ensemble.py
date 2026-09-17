@@ -239,10 +239,10 @@ class TabPFNEnsemble:
     Parameters
     ----------
     config : dict
-        Ensemble configuration dictionary (see tabpfn_config.ENSEMBLE_CONFIG).
+        Ensemble configuration dictionary (see config.ENSEMBLE_CONFIG).
     tabpfn_params : dict
         Keyword arguments forwarded to TabPFNClassifier (see
-        tabpfn_config.TABPFN_PARAMS).
+        config.TABPFN_PARAMS).
     max_samples : int
         Hard upper limit on samples per bag imposed by the TabPFN model.
     max_features : int

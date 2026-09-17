@@ -28,8 +28,8 @@ import torch
 import warnings
 warnings.filterwarnings('ignore')
 
-from Tabpfn_Config import *
-from Tabpfn_Ensemble import TabPFNEnsemble
+from config import *
+from tabpfn_ensemble import TabPFNEnsemble
 
 # ===========================================================================
 # ANALYSIS CONFIGURATION
@@ -182,16 +182,13 @@ def load_and_preprocess(fold: int):
     X_train = pool_df[feature_names]
     y_train = pool_df[label_col].values
 
-    X_test_full = test_df[feature_names]
-    y_test_full = test_df[label_col].values
-
-    target_size = int(len(X_train) * TEST_SAMPLE_RATIO)
-    if len(X_test_full) > target_size:
-        X_test, _, y_test, _ = train_test_split(
-            X_test_full, y_test_full,
-            train_size=target_size, stratify=y_test_full, random_state=42)
-    else:
-        X_test, y_test = X_test_full, y_test_full
+    # Use the full held-out test fold as-is (same 25,248-household test set
+    # evaluated in tabpfn_train.py's Table 2). Earlier versions drew a further
+    # TEST_SAMPLE_RATIO-sized stratified subsample here, which silently
+    # evaluated XAI on a different, smaller test set than the one reported
+    # for predictive performance.
+    X_test = test_df[feature_names]
+    y_test = test_df[label_col].values
 
     print(f"  Train : {len(X_train):,} | {len(feature_names):,} features")
     print(f"  Test  : {len(X_test):,}")
@@ -203,7 +200,7 @@ def compute_detailed_metrics(y_true, y_pred, y_prob):
     report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
     return {
         'accuracy':           float((y_true == y_pred).mean()),
-        'macro_auc':          roc_auc_score(y_true, y_pred, average='macro', multi_class='ovr'),
+        'roc_auc':            float(roc_auc_score(y_true, y_prob)),
         'macro_f1':           float(report.get('macro avg', {}).get('f1-score', np.nan)),
         'weighted_f1':        float(report.get('weighted avg', {}).get('f1-score', np.nan)),
         'log_loss':           float(log_loss(y_true, np.column_stack([1-y_prob, y_prob]))),
@@ -1031,7 +1028,7 @@ def run_tabpfn_pipeline(
         with open(metrics_path) as fh:
             metrics = json.load(fh)
 
-    print(f"  AUC={metrics['macro_auc']:.4f}  F1={metrics['macro_f1']:.4f}")
+    print(f"  ROC-AUC={metrics['roc_auc']:.4f}  F1={metrics['macro_f1']:.4f}")
 
     best_idx   = int(np.argmax(ensemble.oob_scores))
     best_model = ensemble.models[best_idx]['model']

@@ -186,7 +186,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
     y_prob_2d = np.column_stack([1 - y_prob, y_prob])
 
-    macro_auc  = roc_auc_score(y_true, y_prob)
+    roc_auc  = roc_auc_score(y_true, y_prob)
     pr_auc     = average_precision_score(y_true, y_prob)
 
     result = {
@@ -198,7 +198,7 @@ def compute_metrics(y_true, y_pred, y_prob):
         'log_loss':          float(log_loss(y_true, y_prob_2d)),
 
         # ── Macro ─────────────────────────────────────────────────────────
-        'macro_auc':       float(macro_auc),
+        'roc_auc':       float(roc_auc),
         'macro_pr_auc':    float(pr_auc),
         'macro_f1':        float(report['macro avg']['f1-score']),
         'macro_precision': float(report['macro avg']['precision']),
@@ -240,7 +240,7 @@ def print_metrics(metrics: dict, title: str):
     print(f"\n{'='*60}")
     print(f"{title}")
     print(f"{'='*60}")
-    print(f"Macro AUC:        {metrics['macro_auc']:.4f}")
+    print(f"ROC-AUC:        {metrics['roc_auc']:.4f}")
     print(f"Macro F1:         {metrics['macro_f1']:.4f}")
     print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
     print(f"Log Loss:         {metrics['log_loss']:.4f}")
@@ -328,7 +328,7 @@ def run_bagging_ensemble(
         bm = compute_metrics(y_eval, y_pred, y_proba)
         bm.update({'bag_id': bag_id+1, 'fit_time': fit_time})
         bag_metrics.append(bm)
-        print(f"  Bag {bag_id+1}  macro_auc={bm['macro_auc']:.4f}  macro_f1={bm['macro_f1']:.4f}")
+        print(f"  Bag {bag_id+1}  roc_auc={bm['roc_auc']:.4f}  macro_f1={bm['macro_f1']:.4f}")
 
     # ── Ensemble via soft voting ───────────────────────────────────────────
     all_proba_arr   = np.array(all_proba)                   # (n_bags, n_eval)
@@ -347,10 +347,10 @@ def run_bagging_ensemble(
     })
 
     # Improvement summary
-    bag_aucs = [m['macro_auc'] for m in bag_metrics]
+    bag_aucs = [m["roc_auc"] for m in bag_metrics]
     bag_f1s  = [m['macro_f1']  for m in bag_metrics]
     print(f"\n  Ensemble vs Bags ({eval_tag}):")
-    print(f"    macro_auc  ensemble={ensemble_metrics['macro_auc']:.4f}  "
+    print(f"    roc_auc    ensemble={ensemble_metrics['roc_auc']:.4f}  "
           f"best_bag={max(bag_aucs):.4f}  avg={np.mean(bag_aucs):.4f}±{np.std(bag_aucs):.4f}")
     print(f"    macro_f1   ensemble={ensemble_metrics['macro_f1']:.4f}  "
           f"best_bag={max(bag_f1s):.4f}  avg={np.mean(bag_f1s):.4f}±{np.std(bag_f1s):.4f}")
@@ -443,7 +443,7 @@ def main():
         }
         m = r['test']
         row.update({
-            'test_macro_auc':       m['macro_auc'],
+            'test_roc_auc':       m['roc_auc'],
             'test_macro_f1':        m['macro_f1'],
             'test_weighted_f1':     m['weighted_f1'],
             'test_log_loss':        m['log_loss'],
@@ -478,7 +478,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"TEST SET — AVERAGED ACROSS {len(summary_df)} FOLDS:")
     print(f"{'='*60}")
-    print(f"Macro AUC:           {summary_df['test_macro_auc'].mean():.4f} ± {summary_df['test_macro_auc'].std():.4f}")
+    print(f"ROC-AUC:           {summary_df['test_roc_auc'].mean():.4f} ± {summary_df['test_roc_auc'].std():.4f}")
     print(f"Macro F1:            {summary_df['test_macro_f1'].mean():.4f} ± {summary_df['test_macro_f1'].std():.4f}")
     print(f"Weighted F1:         {summary_df['test_weighted_f1'].mean():.4f} ± {summary_df['test_weighted_f1'].std():.4f}")
     print(f"Log Loss:            {summary_df['test_log_loss'].mean():.4f} ± {summary_df['test_log_loss'].std():.4f}")
