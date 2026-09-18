@@ -101,7 +101,6 @@ ENSEMBLE_CONFIG = {
 # TRAINING CONFIGURATION
 # ===========================================================================
 PREDICT_BATCH_SIZE = 5000
-TEST_SAMPLE_RATIO = 0.1  # Test set sampling ratio (relative to training set size)
 
 # ===========================================================================
 # ENVIRONMENT CONFIGURATION
