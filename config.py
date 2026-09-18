@@ -17,12 +17,12 @@ TABPFN_HARDWARE_AND_MODEL_PARAMETERS
 ENSEMBLE_STRATEGY_CONFIGURATION
     Bagging strategy, bag size, class-balancing strategy and target ratio.
 TRAINING_CONFIGURATION
-    Prediction batch size and test-set sampling ratio.
+    Prediction batch size.
 
 Kernel SHAP sample sizes and approximation settings for the explainability
-pipeline (global/subgroup/local) live in ``tabpfn_xai.py`` itself
-(``GLOBAL_SHAP_CONFIG``, ``SUBGROUP_CONFIG``, ``LOCAL_SHAP_CONFIG``), since
-that module is the only consumer.
+pipeline (global/local) live in ``tabpfn_xai.py`` itself
+(``GLOBAL_SHAP_CONFIG``, ``LOCAL_SHAP_CONFIG``), since that module is the
+only consumer.
 """
 
 import os
