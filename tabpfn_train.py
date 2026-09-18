@@ -75,12 +75,12 @@ CV_CONFIG = {
     'random_state': 42,
 }
 
-TABPFN_MODEL_PARAMS = {
-    'device': 'cuda',
-    'n_estimators': 8,
-    'ignore_pretraining_limits': False,
-    'model_path': './tabpfn_weights/tabpfn-v2.5-classifier-v2.5_default.ckpt',
-}
+# Reuse config.py's TABPFN_PARAMS (device/n_estimators/model_path) rather
+# than a second, independently hardcoded copy -- config.py already fails
+# fast if the local checkpoint at MODEL_PATH is missing, and duplicating
+# the path here risked the two drifting apart (e.g. only one of them
+# getting updated after a checkpoint move).
+TABPFN_MODEL_PARAMS = TABPFN_PARAMS.copy()
 
 
 print("\n" + "="*80)
