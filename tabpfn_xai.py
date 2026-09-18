@@ -83,7 +83,7 @@ class EnsembleModelAdapter:
 GLOBAL_SHAP_CONFIG = {
     'n_explain':      1000,   # households sampled (stratified by label) for global SHAP
     'n_background':     50,
-    'max_evals':       120,
+    'max_evals':       100,
     'batch_size':        50,
     'top_n_display':    30,
 }
