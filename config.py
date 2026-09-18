@@ -50,8 +50,23 @@ TABPFN_PARAMS = {
     'ignore_pretraining_limits': False,  # Must be False to enforce v2.5 limits
 }
 
-# If custom model weight path exists
-if MODEL_PATH is not None and os.path.isfile(MODEL_PATH):
+# Require the local checkpoint rather than silently falling back to
+# TabPFN's default network download. This pipeline is meant to run in
+# network-isolated environments, where a silent fallback here would not
+# fail until the first TabPFNClassifier(...) call deep inside training or
+# XAI -- potentially after hours of unrelated work -- and could hang
+# rather than error out cleanly if outbound network access is blocked
+# rather than merely refused. Failing fast at import time makes a missing
+# or misplaced checkpoint obvious immediately instead of much later.
+if MODEL_PATH is not None:
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(
+            f"TabPFN checkpoint not found at MODEL_PATH={MODEL_PATH!r} "
+            f"(resolved from cwd={os.getcwd()!r}). This pipeline requires "
+            f"the local checkpoint -- it does not fall back to downloading "
+            f"one, since that would hang or fail in network-isolated "
+            f"environments. Place the checkpoint at this path (or update "
+            f"MODEL_PATH) before running training or tabpfn_xai.py.")
     TABPFN_PARAMS['model_path'] = MODEL_PATH
 
 # ===========================================================================
@@ -92,3 +107,13 @@ TEST_SAMPLE_RATIO = 0.1  # Test set sampling ratio (relative to training set siz
 # ENVIRONMENT CONFIGURATION
 # ===========================================================================
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Belt-and-suspenders for network-isolated environments: the MODEL_PATH
+# check above already ensures TabPFNClassifier is constructed with a local
+# checkpoint, but if the underlying tabpfn/huggingface_hub stack still
+# probes the network for anything else (version checks, telemetry, hub
+# metadata), these tell it to stay offline instead of hanging on a
+# blocked connection. Harmless no-ops if unused. setdefault() so an
+# environment variable already set in the shell is never overridden.
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
